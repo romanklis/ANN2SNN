@@ -1,0 +1,9 @@
+# Core runtime deps for the ball-and-plate simulation engine.
+torch>=2.0
+numpy>=1.23
+
+# Optional (only needed by examples/run_benchmark.py --plot)
+# matplotlib>=3.6
+
+# Optional (tests)
+# pytest>=7.0
