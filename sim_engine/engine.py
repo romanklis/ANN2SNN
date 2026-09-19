@@ -33,6 +33,7 @@ from .config import (
     TrainingConfig,
 )
 from .controllers import BaseController
+from .environment import EmbodiedEnv
 from .physics import BallPlatePlant, step_physics
 from .reference import Reference, orbit_reference
 from .registry import ControllerRegistry, LABELS
@@ -75,9 +76,25 @@ class Engine:
 
         do_train = self.config.train_on_init if train is None else train
         if do_train:
-            distilled = training_mod.distill(
-                self.config.network, self.config.training, log_fn=self._log
-            )
+            profile = getattr(self.config.training, "profile", "clean")
+            if profile == "robust":
+                # Distil the teacher inside the same embodied environment the
+                # controller will be evaluated in (noise/delay/perturbations).
+                train_cfg = dataclasses.replace(
+                    self.config.training,
+                    embodiment=self.config.training.embodiment
+                    or self.config.benchmark.embodiment,
+                )
+                distilled = training_mod.distill_embodied(
+                    self.config.network,
+                    train_cfg,
+                    benchmark=self.config.benchmark,
+                    log_fn=self._log,
+                )
+            else:
+                distilled = training_mod.distill(
+                    self.config.network, self.config.training, log_fn=self._log
+                )
             dense = distilled["dense"]
             connectome = distilled["connectome"]
             self.last_training = {
@@ -143,12 +160,24 @@ class Engine:
         """Run one controller over the full closed-loop orbit."""
         ctrl = self.build_controller(name)
         init = torch.tensor(self.config.plant.init_state, dtype=torch.float32)
+        cfg = config or self.config.benchmark
+        emb = getattr(cfg, "embodiment", None)
+        env = None
+        if emb is not None and emb.enable and not emb.is_clean:
+            env = EmbodiedEnv(
+                emb,
+                dt=self.config.plant.dt,
+                max_tilt=self.config.plant.max_tilt,
+                device=self.device,
+                init_state=self.config.plant.init_state,
+            )
         return run_closed_loop(
             ctrl,
             reference=reference or self.reference(),
             init_state=init,
-            config=config or self.config.benchmark,
+            config=cfg,
             name=name,
+            env=env,
         )
 
     def run_benchmark(
@@ -256,6 +285,16 @@ class SimulationSession:
             device=engine.device,
         )
         self.controller = engine.build_controller(self.name)
+        emb = engine.config.benchmark.embodiment
+        self.env = None
+        if emb is not None and emb.enable and not emb.is_clean:
+            self.env = EmbodiedEnv(
+                emb,
+                dt=engine.config.plant.dt,
+                max_tilt=engine.config.plant.max_tilt,
+                device=engine.device,
+                init_state=self.init_state,
+            )
         self.k = 0
         self.done = False
         self.history: Dict[str, list] = {"state": [], "tilt": [], "error_cm": [], "target": []}
@@ -265,6 +304,8 @@ class SimulationSession:
     def reset(self) -> dict:
         self.controller.reset()
         self.plant.reset()
+        if self.env is not None:
+            self.env.reset()
         self.k = 0
         self.done = False
         self.history = {"state": [], "tilt": [], "error_cm": [], "target": []}
@@ -283,14 +324,22 @@ class SimulationSession:
 
         state = self.plant.state
         if action is None:
+            observation = self.env.observe(state) if self.env is not None else state
             with torch.no_grad():
-                tilt = self.controller.act(state, self.reference.at(self.k))
+                tilt = self.controller.act(observation, self.reference.at(self.k))
         else:
             tilt = torch.as_tensor(action, dtype=torch.float32, device=self.engine.device)
 
-        tilt_vec = tilt.detach().cpu().numpy()
+        if self.env is not None:
+            applied = self.env.actuate(tilt)
+            self.plant.state = self.env.step(state, applied, self.k)
+            self.plant.t += 1
+        else:
+            applied = tilt
+            self.plant.step(tilt)
+
+        tilt_vec = applied.detach().cpu().numpy()
         self.history["tilt"].append(tilt_vec)
-        self.plant.step(tilt)
         self.k += 1
         self.done = self.k >= len(self.reference)
         return self.observe(tilt=tilt_vec)

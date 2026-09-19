@@ -24,7 +24,8 @@ import torch
 
 from .config import BenchmarkConfig
 from .controllers.base import BaseController
-from .physics import DT, step_physics
+from .environment import EmbodiedEnv
+from .physics import DT, PLATE_HALF, step_physics
 from .reference import Reference, orbit_reference
 from .serialization import to_jsonable
 
@@ -53,6 +54,13 @@ class TrajectoryResult:
     settling_step: Optional[int] = None
     spikes: Optional[np.ndarray] = None   # (T, N)
     meta: dict = field(default_factory=dict)
+    #: embodiment metrics (present only when the run used an EmbodiedEnv)
+    on_plate_pct: Optional[float] = None
+    impulse_count: Optional[int] = None
+    recovery_steps: Optional[list] = None
+    max_recovery_step: Optional[int] = None
+    disturbance_rms: Optional[float] = None
+    env: Optional[dict] = None
 
     def to_dict(self, include_trace: bool = True) -> dict:
         d = {
@@ -66,6 +74,18 @@ class TrajectoryResult:
             },
             "meta": dict(self.meta),
         }
+        if self.on_plate_pct is not None:
+            d["metrics"]["on_plate_pct"] = self.on_plate_pct
+        if self.impulse_count is not None:
+            d["metrics"]["impulse_count"] = self.impulse_count
+        if self.max_recovery_step is not None:
+            d["metrics"]["max_recovery_step"] = self.max_recovery_step
+        if self.disturbance_rms is not None:
+            d["metrics"]["disturbance_rms"] = self.disturbance_rms
+        if self.recovery_steps is not None:
+            d["recovery_steps"] = list(self.recovery_steps)
+        if self.env is not None:
+            d["env"] = dict(self.env)
         if include_trace:
             d["trajectory"] = self.trajectory.tolist()
             d["tilts"] = self.tilts.tolist()
@@ -131,8 +151,15 @@ def run_closed_loop(
     *,
     record_spikes: Optional[bool] = None,
     name: Optional[str] = None,
+    env: Optional[EmbodiedEnv] = None,
 ) -> TrajectoryResult:
-    """Roll the plant + controller forward over the whole reference trajectory."""
+    """Roll the plant + controller forward over the whole reference trajectory.
+
+    When ``env`` is given the controller only sees ``env.observe(state)`` and its
+    command passes through ``env.actuate`` / ``env.step``; the recorded
+    ``trajectory`` is always the **true** plant state.  With ``env=None`` the
+    original clean loop runs unchanged.
+    """
     config = config or BenchmarkConfig()
     if reference is None:
         reference = orbit_reference(
@@ -147,24 +174,38 @@ def run_closed_loop(
         init_state = torch.tensor([-0.05, 0.05, 0.0, 0.0], device=device)
     state = torch.as_tensor(init_state, dtype=torch.float32, device=device).clone()
 
+    use_env = env is not None
+    if use_env:
+        env.reset()
+
     controller.reset()
 
     traj: List[np.ndarray] = []
     tilts: List[np.ndarray] = []
     spikes: List[np.ndarray] = []
+    disturbances: List[np.ndarray] = []
+    impulse_frames: List[int] = []
     wants_spikes = bool(record_spikes and getattr(controller, "spiking", False))
 
     with torch.no_grad():
         for k in range(steps):
             traj.append(state.detach().cpu().numpy().copy())
             ref_k = reference.at(k)
-            u = controller.act(state, ref_k)
+            observation = env.observe(state) if use_env else state
+            u = controller.act(observation, ref_k)
             tilts.append(u.detach().cpu().numpy().copy())
             if wants_spikes:
                 spk = controller.last_spikes()
                 if spk is not None:
                     spikes.append(spk.detach().cpu().numpy().copy())
-            state = step_physics(state, u, dt=reference.dt)
+            if use_env:
+                u_eff = env.actuate(u)
+                state = env.step(state, u_eff, k)
+                disturbances.append(env.last_disturbance.detach().cpu().numpy().copy())
+                if env.last_impulse:
+                    impulse_frames.append(k)
+            else:
+                state = step_physics(state, u, dt=reference.dt)
 
     trajectory = np.asarray(traj)
     tilt_arr = np.asarray(tilts)
@@ -180,6 +221,28 @@ def run_closed_loop(
             settling = i
             break
 
+    on_plate_pct = impulse_count = recovery = max_recovery = drms = env_meta = None
+    if use_env:
+        pos = trajectory[:, :2]
+        inside = np.all(np.abs(pos) <= PLATE_HALF, axis=1)
+        on_plate_pct = float(100.0 * np.mean(inside)) if len(inside) else 0.0
+
+        recovery = []
+        for f in impulse_frames:
+            rec = None
+            for j in range(f, len(err)):
+                if err[j] <= tol:
+                    rec = int(j - f)
+                    break
+            recovery.append(rec)
+        valid = [r for r in recovery if r is not None]
+        max_recovery = int(max(valid)) if valid else None
+        impulse_count = int(len(impulse_frames))
+        if disturbances:
+            da = np.asarray(disturbances)
+            drms = float(np.sqrt(np.mean(np.sum(da ** 2, axis=1))))
+        env_meta = env.describe()
+
     return TrajectoryResult(
         name=name or controller.name,
         trajectory=trajectory,
@@ -192,6 +255,12 @@ def run_closed_loop(
         settling_step=settling,
         spikes=np.asarray(spikes) if spikes else None,
         meta={"controller": controller.describe()},
+        on_plate_pct=on_plate_pct,
+        impulse_count=impulse_count,
+        recovery_steps=recovery,
+        max_recovery_step=max_recovery,
+        disturbance_rms=drms,
+        env=env_meta,
     )
 
 
@@ -213,16 +282,27 @@ def evaluate(
     if init_state is None:
         init_state = torch.tensor([-0.05, 0.05, 0.0, 0.0])
 
+    embodiment = getattr(config, "embodiment", None)
+    use_env = bool(
+        embodiment is not None and embodiment.enable and not embodiment.is_clean
+    )
+    init_tuple = tuple(float(v) for v in init_state)
+
     results: Dict[str, TrajectoryResult] = {}
     for name, ctrl in controllers.items():
+        env = None
+        if use_env:
+            # A fresh env per controller, same seed -> identical disturbances.
+            env = EmbodiedEnv(embodiment, dt=reference.dt, init_state=init_tuple)
         results[name] = run_closed_loop(
-            ctrl, reference=reference, init_state=init_state, config=config, name=name
+            ctrl, reference=reference, init_state=init_state, config=config,
+            name=name, env=env,
         )
 
     return BenchmarkReport(
         reference=reference,
         results=results,
-        init_state=tuple(float(v) for v in init_state),
+        init_state=init_tuple,
         config=config.to_dict(),
     )
 

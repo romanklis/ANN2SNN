@@ -27,9 +27,12 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from .config import NetworkConfig, TrainingConfig
+from .config import BenchmarkConfig, EmbodimentConfig, NetworkConfig, TrainingConfig
 from .controllers import ClassicalPDController, ConnectomeANNController, DenseNNController
-from .physics import SYNAPSES_PER_NEURON
+from .controllers.base import error_vector
+from .environment import EmbodiedEnv
+from .physics import MAX_TILT, SYNAPSES_PER_NEURON
+from .reference import orbit_reference
 
 __all__ = [
     "sample_errors",
@@ -37,6 +40,9 @@ __all__ = [
     "train_dense_controller",
     "train_connectome_controller",
     "distill",
+    "distill_embodied",
+    "distill_profile",
+    "generate_embodied_episodes",
     "save_weights",
     "load_weights",
 ]
@@ -207,6 +213,225 @@ def distill(
         },
         "config": config.to_dict(),
     }
+
+
+# --------------------------------------------------------------------------- #
+# Embodied ("robust") distillation: distil the PD teacher inside the env
+# --------------------------------------------------------------------------- #
+def generate_embodied_episodes(
+    teacher: ClassicalPDController,
+    config: TrainingConfig,
+    benchmark: Optional[BenchmarkConfig] = None,
+    *,
+    log_fn=None,
+) -> list:
+    """Roll the PD teacher inside an embodied env and collect (error, label) pairs.
+
+    The teacher observes exactly what a student will observe (noisy, delayed) and
+    acts through the same actuator model, so the labels are the deployed control
+    law rather than the ideal one.  Returns one dict per episode with ``errors``
+    ``(E, 4)`` and ``labels`` ``(E, 2)``.
+    """
+    benchmark = benchmark or BenchmarkConfig(steps=int(config.episode_steps))
+    embodiment = config.embodiment or EmbodimentConfig.from_preset("embodied")
+    steps = int(config.episode_steps)
+    ref = orbit_reference(steps=steps, radius=benchmark.radius, freq=benchmark.freq)
+    env = EmbodiedEnv(embodiment, dt=ref.dt, max_tilt=MAX_TILT, device=config.device)
+
+    episodes = []
+    for ep in range(int(config.episodes)):
+        env.reset(seed=int(config.seed) + ep)
+        state = torch.tensor([-0.05, 0.05, 0.0, 0.0], dtype=torch.float32, device=config.device)
+        errs, labels = [], []
+        with torch.no_grad():
+            for k in range(steps):
+                observation = env.observe(state)
+                err = error_vector(observation, ref.at(k))
+                errs.append(err)
+                labels.append(pd_target(err.unsqueeze(0), teacher)[0])
+                u = teacher.act(observation, ref.at(k))
+                state = env.step(state, env.actuate(u), k)
+        episodes.append({"errors": torch.stack(errs), "labels": torch.stack(labels)})
+        if log_fn:
+            log_fn("data", ep + 1, 0.0)
+    return episodes
+
+
+def train_dense_embodied(
+    controller: DenseNNController,
+    episodes: list,
+    config: Optional[TrainingConfig] = None,
+    *,
+    log_fn=None,
+) -> Dict[str, object]:
+    """Distil pooled embodied (error, label) pairs into the dense ANN."""
+    config = config or TrainingConfig()
+    device = _device_of(controller)
+    dtype = next(controller.parameters()).dtype
+    torch.manual_seed(config.seed)
+    opt = optim.Adam(controller.parameters(), lr=config.lr)
+    criterion = nn.MSELoss()
+    history: List[float] = []
+
+    errs = torch.cat([e["errors"] for e in episodes]).to(device, dtype)
+    labels = torch.cat([e["labels"] for e in episodes]).to(device, dtype)
+    n = int(errs.shape[0])
+    if n == 0:
+        return {"loss": history, "final_loss": float("nan")}
+
+    controller.train()
+    for epoch in range(1, config.epochs + 1):
+        idx = torch.randint(0, n, (min(config.batch_size, n),), device=device)
+        x, y = errs[idx], labels[idx]
+        if config.noise_augment:
+            x = x + torch.randn_like(x) * config.noise_augment
+        opt.zero_grad()
+        pred = controller.net(x).clamp(-controller.max_tilt, controller.max_tilt)
+        loss = criterion(pred, y)
+        loss.backward()
+        opt.step()
+        history.append(float(loss.item()))
+        if log_fn and (epoch % config.log_every == 0 or epoch == 1):
+            log_fn("dense", epoch, history[-1])
+    controller.eval()
+    return {"loss": history, "final_loss": history[-1] if history else float("nan")}
+
+
+def train_connectome_embodied(
+    controller: ConnectomeANNController,
+    episodes: list,
+    config: Optional[TrainingConfig] = None,
+    *,
+    log_fn=None,
+) -> Dict[str, object]:
+    """Distil embodied pairs into the recurrent connectome on contiguous windows.
+
+    Windows let the recurrence integrate the delayed/noisy observation stream,
+    which is the only way delay compensation can be learned.
+    """
+    config = config or TrainingConfig()
+    device = _device_of(controller)
+    dtype = next(controller.parameters()).dtype
+    W = max(1, int(config.connectome_unroll))
+
+    windows = []
+    for e in episodes:
+        errs_e, labels_e = e["errors"], e["labels"]
+        if errs_e.shape[0] < W:
+            continue
+        if errs_e.shape[0] == W:
+            windows.append((errs_e, labels_e))
+        else:
+            for _ in range(max(1, config.batch_size)):
+                s = int(torch.randint(0, errs_e.shape[0] - W, (1,)).item())
+                windows.append((errs_e[s:s + W], labels_e[s:s + W]))
+    if not windows:
+        return {"loss": [], "final_loss": float("nan")}
+
+    errs = torch.stack([w[0] for w in windows]).to(device, dtype)      # (N, W, 4)
+    labels = torch.stack([w[1] for w in windows]).to(device, dtype)    # (N, W, 2)
+    n = int(errs.shape[0])
+
+    torch.manual_seed(config.seed)
+    opt = optim.Adam(controller.parameters(), lr=config.lr)
+    criterion = nn.MSELoss()
+    history: List[float] = []
+
+    controller.train()
+    for epoch in range(1, config.epochs + 1):
+        idx = torch.randint(0, n, (min(config.batch_size, n),), device=device)
+        x, y = errs[idx], labels[idx]
+        if config.noise_augment:
+            x = x + torch.randn_like(x) * config.noise_augment
+        opt.zero_grad()
+        w_sparse = controller.get_sparse_matrix()
+        h = torch.zeros(x.shape[0], controller.n_neurons, device=device, dtype=dtype)
+        preds = []
+        for t in range(W):
+            recurrent_drive = torch.sparse.mm(w_sparse, h.T).T
+            h = controller.relu(controller.w_in(x[:, t, :]) + recurrent_drive)
+            preds.append(controller.w_out(h).clamp(-controller.max_tilt, controller.max_tilt))
+        pred = torch.stack(preds, dim=1)
+        loss = criterion(pred, y)
+        loss.backward()
+        opt.step()
+        history.append(float(loss.item()))
+        if log_fn and (epoch % config.log_every == 0 or epoch == 1):
+            log_fn("connectome", epoch, history[-1])
+    controller.eval()
+    return {"loss": history, "final_loss": history[-1] if history else float("nan")}
+
+
+def distill_embodied(
+    network: Optional[NetworkConfig] = None,
+    config: Optional[TrainingConfig] = None,
+    *,
+    dense: Optional[DenseNNController] = None,
+    connectome: Optional[ConnectomeANNController] = None,
+    benchmark: Optional[BenchmarkConfig] = None,
+    log_fn=None,
+) -> Dict[str, object]:
+    """Robust profile: distil both students from the embodied PD teacher."""
+    network = network or NetworkConfig()
+    config = config or TrainingConfig(profile="robust")
+    if config.profile != "robust":
+        config = dataclasses.replace(config, profile="robust")
+
+    device = config.device
+    if dense is None:
+        dense = DenseNNController(
+            n_in=network.n_in, n_neurons=network.n_neurons,
+            n_out=network.n_out, device=device, seed=config.seed,
+        )
+    if connectome is None:
+        connectome = ConnectomeANNController(
+            n_in=network.n_in, n_neurons=network.n_neurons, n_out=network.n_out,
+            synapses_per_neuron=network.synapses_per_neuron,
+            inhibitory_fraction=network.inhibitory_fraction,
+            excitatory_weight=network.excitatory_weight,
+            inhibitory_weight=network.inhibitory_weight,
+            seed=config.seed, device=device,
+        )
+
+    teacher = ClassicalPDController(device=device)
+    episodes = generate_embodied_episodes(teacher, config, benchmark, log_fn=log_fn)
+    dense_hist = train_dense_embodied(dense, episodes, config, log_fn=log_fn)
+    conn_hist = train_connectome_embodied(connectome, episodes, config, log_fn=log_fn)
+
+    return {
+        "dense": dense,
+        "connectome": connectome,
+        "teacher": teacher,
+        "history": {"dense": dense_hist["loss"], "connectome": conn_hist["loss"]},
+        "final_loss": {
+            "dense": dense_hist["final_loss"],
+            "connectome": conn_hist["final_loss"],
+        },
+        "config": config.to_dict(),
+        "episodes": len(episodes),
+    }
+
+
+def distill_profile(
+    profile: str = "clean",
+    network: Optional[NetworkConfig] = None,
+    config: Optional[TrainingConfig] = None,
+    *,
+    dense: Optional[DenseNNController] = None,
+    connectome: Optional[ConnectomeANNController] = None,
+    benchmark: Optional[BenchmarkConfig] = None,
+    log_fn=None,
+) -> Dict[str, object]:
+    """Dispatch to the clean or robust distillation path."""
+    config = config or TrainingConfig()
+    if profile and profile != config.profile:
+        config = dataclasses.replace(config, profile=profile)
+    if config.profile == "robust":
+        return distill_embodied(
+            network, config, dense=dense, connectome=connectome,
+            benchmark=benchmark, log_fn=log_fn,
+        )
+    return distill(network, config, dense=dense, connectome=connectome, log_fn=log_fn)
 
 
 # --------------------------------------------------------------------------- #

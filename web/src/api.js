@@ -89,6 +89,11 @@ export function benchmark(opts, signal) {
   return request("/api/benchmark", { method: "POST", body: compact(opts), signal });
 }
 
+/** POST /api/robustness — environmental sweep for a few controllers. */
+export function robustness(opts, signal) {
+  return request("/api/robustness", { method: "POST", body: compact(opts), signal });
+}
+
 /** POST /api/train — start behavioural distillation. */
 export function startTraining(opts = {}) {
   return request("/api/train", { method: "POST", body: compact(opts) });

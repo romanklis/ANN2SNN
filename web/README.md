@@ -49,6 +49,10 @@ One `POST /api/benchmark` runs the experiment pair (`flylike_ann`,
 * **Tracking (right)** — radial error: ANN solid, SNN dashed.
 * **Result bar (footer)** — `TRANSFER EXPERIMENT`: ANN error · SNN error ·
   `Δ = SNN − ANN` (neutral, no winner).
+* **Environment selector (header)** — `Clean · Noisy · Delayed · Perturbed · Heavy ·
+  Embodied · Randomized` (default **Embodied**) with a `clean`/`robust` policy pill;
+  embodied presets use the robust policy (auto-distilled). A footer **robustness
+  strip** shows ANN/SNN mean error across presets. See `docs/EMBODIMENT.md`.
 * **Single Play/Pause** — one button drives the shared cursor (looping). Fixed
   defaults: seed 42, 250 steps, r 0.15, f 0.5 Hz.
 

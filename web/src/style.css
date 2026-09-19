@@ -64,6 +64,16 @@ body {
 .icon-btn:hover:not(:disabled) { color: var(--text); border-color: var(--accent); }
 .icon-btn:disabled { opacity: .45; cursor: not-allowed; }
 
+.env { display: flex; align-items: center; gap: 5px; }
+.env-label { font-size: 9px; letter-spacing: .1em; color: var(--muted); font-weight: 700; }
+#env-select {
+  background: #0d1320; color: var(--text);
+  border: 1px solid var(--border); border-radius: 7px;
+  padding: 4px 7px; font-size: 11px; font-family: inherit;
+}
+#env-select:focus { outline: 2px solid rgba(77,163,255,.45); outline-offset: 1px; }
+#env-select:disabled { opacity: .5; }
+
 .pill { padding: 3px 9px; border-radius: 999px; font-size: 10.5px; font-weight: 700; letter-spacing: .4px; white-space: nowrap; }
 .pill-idle { background: #2a3547; color: var(--muted); }
 .pill-ok   { background: rgba(74, 222, 128, .15); color: var(--ok); }
@@ -241,6 +251,22 @@ body {
 .rb-delta { font-size: 12px; color: var(--muted); }
 .rb-delta span { color: var(--text); font-weight: 700; font-variant-numeric: tabular-nums; }
 .rb-note { margin-left: auto; font-size: 11px; color: var(--muted); text-align: right; }
+.rb-strip {
+  flex-basis: 100%;
+  display: flex;
+  align-items: center;
+  gap: 6px 14px;
+  flex-wrap: wrap;
+  margin-top: 2px;
+  font-size: 10.5px;
+  color: var(--muted);
+}
+.rb-strip .rb-head { font-weight: 700; letter-spacing: .07em; color: var(--text); }
+.rb-cell { display: flex; align-items: baseline; gap: 5px; }
+.rb-cell .rb-name { color: var(--muted); }
+.rb-cell b.ann { color: var(--accent-2); font-variant-numeric: tabular-nums; }
+.rb-cell b.snn { color: var(--snn); font-variant-numeric: tabular-nums; }
+.rb-cell.sel { outline: 1px solid var(--accent); border-radius: 5px; padding: 1px 5px; }
 
 /* compact 1080p-ish budget ------------------------------------------------ */
 @media (max-height: 820px) {

@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Optional, Sequence
 
 from .config import (
     BenchmarkConfig,
+    EmbodimentConfig,
     EngineConfig,
     NetworkConfig,
     PlantConfig,
@@ -74,6 +75,35 @@ def config_from_dict(data: Optional[dict] = None) -> EngineConfig:
         cfg.network.n_neurons = int(data["n_neurons"])
     if "epochs" in data and data["epochs"] is not None:
         cfg.training.epochs = int(data["epochs"])
+
+    # Embodiment: a preset name, a partial dict, or flat convenience keys.
+    if "embodiment" in data and data["embodiment"] is not None:
+        val = data["embodiment"]
+        if isinstance(val, str):
+            cfg.benchmark.embodiment = EmbodimentConfig.from_preset(val)
+        elif isinstance(val, dict):
+            base = dataclasses.asdict(cfg.benchmark.embodiment)
+            base.update({k: v for k, v in val.items() if v is not None})
+            cfg.benchmark.embodiment = EmbodimentConfig(**base)
+    if "embodiment_preset" in data and data["embodiment_preset"]:
+        cfg.benchmark.embodiment = EmbodimentConfig.from_preset(data["embodiment_preset"])
+    flat_emb = {
+        "sensor_noise_pos": "sensor_noise_pos",
+        "sensor_noise_vel": "sensor_noise_vel",
+        "sensor_delay": "sensor_delay",
+        "actuator_delay": "actuator_delay",
+        "disturbance_std": "process_noise",
+        "damping": "damping",
+        "c_scale": "c_scale",
+    }
+    for src, dst in flat_emb.items():
+        if src in data and data[src] is not None:
+            value = data[src]
+            if dst in ("sensor_delay", "actuator_delay"):
+                value = int(value)
+            elif dst != "preset":
+                value = float(value)
+            setattr(cfg.benchmark.embodiment, dst, value)
 
     return cfg
 

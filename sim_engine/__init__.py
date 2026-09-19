@@ -27,12 +27,15 @@ from __future__ import annotations
 from . import physics, reference, serialization
 from .benchmark import BenchmarkReport, TrajectoryResult, evaluate, run_closed_loop
 from .config import (
+    EMBODIMENT_PRESETS,
     BenchmarkConfig,
+    EmbodimentConfig,
     EngineConfig,
     NetworkConfig,
     PlantConfig,
     TrainingConfig,
 )
+from .environment import EmbodiedEnv, embodiment_specs
 from .controllers import (
     BaseController,
     ClassicalPDController,
@@ -72,6 +75,9 @@ __all__ = [
     "ConnectomeANNController", "ConnectomeTopology", "LosslessConnectomeSNN",
     # config
     "PlantConfig", "NetworkConfig", "BenchmarkConfig", "TrainingConfig", "EngineConfig",
+    "EmbodimentConfig", "EMBODIMENT_PRESETS",
+    # environment
+    "EmbodiedEnv", "embodiment_specs",
     # reference
     "RefPoint", "Reference", "orbit_reference",
     # orchestration

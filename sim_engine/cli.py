@@ -27,6 +27,7 @@ import sys
 from typing import List, Optional
 
 from .api import build_engine, config_from_dict, list_controllers
+from .config import EMBODIMENT_PRESETS
 from .engine import Engine
 from .physics import DT
 from .registry import CANONICAL_CONTROLLERS
@@ -43,6 +44,10 @@ def _add_engine_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--device", default="cpu", help="torch device (cpu/cuda/auto)")
     p.add_argument("--weights", default=None, help="path to a trained .pt weights bundle")
     p.add_argument("--train", action="store_true", help="distil weights before running")
+    p.add_argument(
+        "--embodiment", default=None, choices=sorted(EMBODIMENT_PRESETS),
+        help="embodied environment preset (default: clean)",
+    )
 
 
 def _engine_from_args(args) -> Engine:
@@ -57,6 +62,8 @@ def _engine_from_args(args) -> Engine:
         "weights_path": args.weights,
         "train_on_init": bool(getattr(args, "train", False)),
     }
+    if getattr(args, "embodiment", None):
+        cfg["embodiment_preset"] = args.embodiment
     return build_engine(cfg, train=bool(getattr(args, "train", False)))
 
 
@@ -102,9 +109,16 @@ def cmd_benchmark(args) -> int:
 
 def cmd_train(args) -> int:
     from . import training as training_mod
-    from .config import NetworkConfig, TrainingConfig
+    from .config import BenchmarkConfig, EmbodimentConfig, NetworkConfig, TrainingConfig
 
     net = NetworkConfig(n_neurons=args.neurons)
+    embodiment = None
+    if args.profile == "robust":
+        embodiment = (
+            EmbodimentConfig.from_preset(args.embodiment)
+            if args.embodiment
+            else EmbodimentConfig.from_preset("embodied")
+        )
     cfg = TrainingConfig(
         epochs=args.epochs,
         batch_size=args.batch_size,
@@ -112,10 +126,20 @@ def cmd_train(args) -> int:
         device=args.device,
         log_every=args.log_every,
         seed=args.seed,
+        profile=args.profile,
+        embodiment=embodiment,
+        episodes=args.episodes,
+        episode_steps=args.episode_steps,
+        noise_augment=args.noise_augment,
     )
-    result = training_mod.distill(net, cfg, log_fn=lambda w, e, l: print(
-        f"[train:{w}] epoch {e:03d} | loss {l:.6f}"
-    ))
+    result = training_mod.distill_profile(
+        args.profile,
+        net,
+        cfg,
+        benchmark=BenchmarkConfig(steps=args.episode_steps),
+        log_fn=lambda w, e, l: print(f"[train:{w}] epoch {e:03d} | loss {l:.6f}"),
+    )
+    print(f"profile               : {args.profile}")
     print(f"final dense loss      : {result['final_loss']['dense']:.6f}")
     print(f"final connectome loss : {result['final_loss']['connectome']:.6f}")
 
@@ -127,6 +151,45 @@ def cmd_train(args) -> int:
             training=result["config"],
         )
         print(f"saved weights -> {args.save}")
+    return 0
+
+
+def cmd_robustness(args) -> int:
+    """Sweep tracking error across one environmental axis."""
+    from .config import BenchmarkConfig
+    from .robustness import sweep as robustness_sweep
+
+    engine = _engine_from_args(args)
+    names = (
+        args.controllers.split(",")
+        if args.controllers
+        else ["pid", "flylike_ann", "snn_transferred"]
+    )
+    cfg = BenchmarkConfig(steps=args.steps, radius=args.radius, freq=args.freq)
+
+    result = robustness_sweep(
+        lambda: {n: engine.build_controller(n) for n in names},
+        config=cfg,
+        axis=args.axis,
+    )
+
+    if args.out:
+        with open(args.out, "w") as fh:
+            json.dump(result, fh, indent=2)
+        print(f"wrote {args.out}")
+
+    print("=" * 66)
+    print(f"ROBUSTNESS SWEEP  axis={result['axis']}  steps={result['steps']}")
+    print("=" * 66)
+    header = "point".ljust(12) + "".join(n[:14].ljust(15) for n in names)
+    print(header)
+    for cell in result["cells"]:
+        row = f"{str(cell['point'])[:11]:<12}"
+        for n in names:
+            per = cell["per_controller"].get(n, {})
+            row += f"{per.get('mean_error_cm', float('nan')):>7.3f} cm    "
+        print(row)
+    print("=" * 66)
     return 0
 
 
@@ -186,8 +249,24 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--seed", type=int, default=42)
     sp.add_argument("--device", default="cpu")
     sp.add_argument("--log-every", type=int, default=25)
+    sp.add_argument("--profile", default="clean", choices=["clean", "robust"],
+                    help="clean i.i.d. distillation or robust embodied distillation")
+    sp.add_argument("--embodiment", default=None, choices=sorted(EMBODIMENT_PRESETS),
+                    help="embodiment preset for the robust profile (default: embodied)")
+    sp.add_argument("--episodes", type=int, default=4, help="robust: teacher episodes")
+    sp.add_argument("--episode-steps", type=int, default=250, help="robust: frames per episode")
+    sp.add_argument("--noise-augment", type=float, default=0.0,
+                    help="robust: extra input noise during training")
     sp.add_argument("--save", default=None, help="write a .pt weights bundle here")
     sp.set_defaults(func=cmd_train)
+
+    sp = sub.add_parser("robustness", help="sweep tracking error over environmental difficulty")
+    _add_engine_args(sp)
+    sp.add_argument("--controllers", default=None, help="comma-separated controller names")
+    sp.add_argument("--axis", default="preset",
+                    choices=["preset", "noise", "delay", "impulse"])
+    sp.add_argument("--out", default=None, help="write the sweep JSON here")
+    sp.set_defaults(func=cmd_robustness)
 
     sp = sub.add_parser("session", help="step an interactive session")
     _add_engine_args(sp)

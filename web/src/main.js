@@ -28,6 +28,9 @@ const el = {
   apiPill: $("api-pill"),
   trainedPill: $("trained-pill"),
   capturePill: $("capture-pill"),
+  envSelect: $("env-select"),
+  profilePill: $("profile-pill"),
+  robustStrip: $("robust-strip"),
   clock: $("clock"),
   neuronCount: $("neuron-count"),
   frameCount: $("frame-count"),
@@ -62,6 +65,9 @@ const state = {
   reference: null,
   lastFrame: 0,
   displayRecorder: null,
+  envPreset: "embodied",
+  profile: "robust",
+  envSpecs: {},
 };
 
 // ------------------------------------------------------------------ helpers
@@ -106,6 +112,48 @@ function updateClock(k) {
   el.clock.textContent = `t = ${(k * dt).toFixed(2)} s`;
 }
 
+// ------------------------------------------------------------- environment
+function populateEnvSelect(cat) {
+  if (!el.envSelect || el.envSelect.dataset.ready === "1") return;
+  const presets = cat.embodiment_presets || {};
+  const order = ["clean", "noisy", "delayed", "perturbed", "heavy", "embodied", "randomized"];
+  const names = order.filter((n) => n in presets)
+    .concat(Object.keys(presets).filter((n) => !order.includes(n)));
+  if (!names.length) return;
+  el.envSelect.innerHTML = names
+    .map((n) => `<option value="${n}">${escapeHtml(n)}</option>`)
+    .join("");
+  if (!names.includes(state.envPreset)) state.envPreset = names[0];
+  el.envSelect.value = state.envPreset;
+  el.envSelect.disabled = false;
+  el.envSelect.dataset.ready = "1";
+}
+function applyProfile() {
+  state.profile = state.envPreset === "clean" ? "clean" : "robust";
+  setPill(el.profilePill, state.profile, state.profile === "robust" ? "pill-ok" : "pill-idle");
+}
+async function loadRobustness() {
+  if (!el.robustStrip) return;
+  try {
+    const res = await api.robustness({
+      controllers: [ANN, SNN], axis: "preset", steps: 120, seed: BENCH.seed,
+    });
+    el.robustStrip.innerHTML =
+      '<span class="rb-head">ROBUSTNESS · mean cm (ANN / SNN)</span>' +
+      res.cells
+        .map((c) => {
+          const a = c.per_controller?.[ANN]?.mean_error_cm;
+          const s = c.per_controller?.[SNN]?.mean_error_cm;
+          const sel = c.embodiment?.preset === state.envPreset ? " sel" : "";
+          return `<span class="rb-cell${sel}"><span class="rb-name">${escapeHtml(String(c.point))}</span>` +
+            `<b class="ann">${fmt(a, 1)}</b><b class="snn">${fmt(s, 1)}</b></span>`;
+        })
+        .join("");
+  } catch {
+    el.robustStrip.innerHTML = "";
+  }
+}
+
 // -------------------------------------------------------------------- load
 async function loadOnce() {
   setPill(el.apiPill, "connecting…", "pill-idle");
@@ -113,6 +161,9 @@ async function loadOnce() {
   try {
     const cat = await api.fetchControllers();
     state.catalog = Object.fromEntries((cat.catalog || []).map((c) => [c.name, c]));
+    state.envSpecs = cat.embodiment_presets || {};
+    populateEnvSelect(cat);
+    applyProfile();
 
     const body = await api.benchmark({
       controllers: [ANN, SNN],
@@ -122,6 +173,8 @@ async function loadOnce() {
       freq: BENCH.freq,
       include_trace: true,
       spike_format: "events",
+      embodiment: state.envPreset,
+      profile: state.profile,
     });
     state.results = body.results || {};
     state.stats = body.stats || null;
@@ -188,6 +241,7 @@ async function loadOnce() {
     stage.play();
     updatePlayIcon();
     updateStatus();
+    setTimeout(loadRobustness, 0);
   } catch (err) {
     setPill(el.apiPill, "API unreachable", "pill-bad");
     const base = api.API_BASE || window.location.origin;
@@ -208,7 +262,8 @@ function buildResultBar(ann, snn) {
   const delta = (annErr != null && snnErr != null) ? snnErr - annErr : null;
   el.resultDelta.textContent = signed(delta);
   el.resultDelta.parentElement.title = "difference (SNN − ANN)";
-  el.resultNote.textContent = "closed-loop radial tracking error · Δ = SNN − ANN";
+  el.resultNote.textContent =
+    `closed-loop radial tracking error · Δ = SNN − ANN · env ${state.envPreset} · policy ${state.profile}`;
 }
 
 // ---------------------------------------------------------------- capture
@@ -282,6 +337,11 @@ el.playBtn.addEventListener("click", () => {
 el.recordBtn.addEventListener("click", toggleRecord);
 el.recordTabBtn.addEventListener("click", toggleTabRecord);
 el.exportBtn.addEventListener("click", exportMp4);
+el.envSelect.addEventListener("change", () => {
+  state.envPreset = el.envSelect.value;
+  applyProfile();
+  loadOnce();
+});
 
 stage.onFrame = (k) => {
   raster.setFrame(k);

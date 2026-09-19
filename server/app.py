@@ -22,6 +22,8 @@ Run (inside the DinD ``ann2snn`` image)::
 
 from __future__ import annotations
 
+import dataclasses
+import json
 import os
 import sys
 import tempfile
@@ -63,10 +65,21 @@ import numpy as np  # noqa: E402
 
 from sim_engine.api import EngineService, list_controllers  # noqa: E402
 from sim_engine.benchmark import evaluate, run_closed_loop  # noqa: E402
-from sim_engine.config import BenchmarkConfig, NetworkConfig, TrainingConfig  # noqa: E402
+from sim_engine.config import (  # noqa: E402
+    BenchmarkConfig,
+    EmbodimentConfig,
+    NetworkConfig,
+    TrainingConfig,
+)
 from sim_engine.engine import EngineError  # noqa: E402
+from sim_engine.environment import (  # noqa: E402
+    EmbodiedEnv,
+    embodiment_specs,
+)
 from sim_engine.physics import DT, MAX_TILT  # noqa: E402
 from sim_engine.registry import CANONICAL_CONTROLLERS, LABELS  # noqa: E402
+from sim_engine.robustness import DEFAULT_AXIS_POINTS, MAX_POINTS  # noqa: E402
+from sim_engine.robustness import sweep as robustness_sweep  # noqa: E402
 from sim_engine.serialization import to_jsonable  # noqa: E402
 
 try:  # thread-cap the shared torch runtime once
@@ -275,6 +288,64 @@ def _as_spike_format(body: Dict[str, Any]) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Embodiment / profile parsing
+# --------------------------------------------------------------------------- #
+def _validate_embodiment(cfg: EmbodimentConfig) -> None:
+    """Bound environmental difficulty so a request cannot be pathological."""
+    checks = [
+        ("sensor_noise_pos", cfg.sensor_noise_pos, 0.0, 0.05),
+        ("sensor_noise_vel", cfg.sensor_noise_vel, 0.0, 0.20),
+        ("sensor_delay", cfg.sensor_delay, 0, 20),
+        ("actuator_delay", cfg.actuator_delay, 0, 20),
+        ("actuator_gain", cfg.actuator_gain, 0.1, 3.0),
+        ("damping", cfg.damping, 0.0, 5.0),
+        ("c_scale", cfg.c_scale, 0.3, 2.0),
+        ("process_noise", cfg.process_noise, 0.0, 5.0),
+        ("impulse_std", cfg.impulse_std, 0.0, 1.0),
+        ("impulse_prob", cfg.impulse_prob, 0.0, 1.0),
+        ("impulse_interval", cfg.impulse_interval, 0, 1000),
+    ]
+    for name, value, lo, hi in checks:
+        if value < lo or value > hi:
+            raise BadRequest(f"'embodiment.{name}' must be within [{lo}, {hi}], got {value}")
+
+
+def _env_from_body(body: Dict[str, Any]) -> Optional[EmbodimentConfig]:
+    """Build an :class:`EmbodimentConfig` from the request (or ``None``)."""
+    raw = body.get("embodiment")
+    if raw is None or raw is False:
+        return None
+    if raw is True:
+        return EmbodimentConfig.from_preset("embodied")
+    if isinstance(raw, str):
+        try:
+            return EmbodimentConfig.from_preset(raw)
+        except ValueError as exc:
+            raise BadRequest(str(exc))
+    if isinstance(raw, dict):
+        preset = raw.get("preset")
+        base = EmbodimentConfig.from_preset(preset) if preset else EmbodimentConfig()
+        data = dataclasses.asdict(base)
+        for key, value in raw.items():
+            if key in data and value is not None:
+                data[key] = value
+        try:
+            cfg = EmbodimentConfig(**data)
+        except TypeError as exc:
+            raise BadRequest(f"invalid embodiment object: {exc}")
+        _validate_embodiment(cfg)
+        return cfg
+    raise BadRequest("'embodiment' must be a preset name, a config object, or true")
+
+
+def _profile_from_body(body: Dict[str, Any]) -> str:
+    profile = str(body.get("profile", "clean")).strip().lower()
+    if profile not in {"clean", "robust"}:
+        raise BadRequest("'profile' must be 'clean' or 'robust'")
+    return profile
+
+
+# --------------------------------------------------------------------------- #
 # Runtime: one EngineService per (seed), plus distillation + weights caching
 # --------------------------------------------------------------------------- #
 class Runtime:
@@ -287,22 +358,37 @@ class Runtime:
         self.n_neurons = int(os.environ.get("ANN2SNN_N_NEURONS", str(NetworkConfig().n_neurons)))
         self.micro_steps = DEFAULT_MICRO_STEPS
         self.weights_path: str = WEIGHTS_PATH
+        self.robust_epochs = int(os.environ.get("ANN2SNN_ROBUST_EPOCHS", "60"))
         # Distil on first use when no cached bundle exists, so the learned brains
         # actually balance out of the box. Set ANN2SNN_AUTO_TRAIN=0 to disable.
         self.auto_train = str(os.environ.get("ANN2SNN_AUTO_TRAIN", "1")).strip().lower() \
             not in {"0", "false", "no", "off"}
         self._engines: Dict[str, EngineService] = {}
+        self._weight_overrides: Dict[str, str] = {}
         self.job: Optional[dict] = None
 
     # -- engine construction ------------------------------------------------ #
-    def _weights_path(self, seed: int) -> str:
-        """Per-seed weights bundle (default seed keeps the plain env path)."""
-        if seed == self.default_seed or not self.weights_path:
-            return self.weights_path
-        root, ext = os.path.splitext(self.weights_path)
+    def _weights_path(self, seed: int, profile: str = "clean") -> str:
+        """Per-(profile, seed) weights bundle path."""
+        override = self._weight_overrides.get(profile)
+        base = override or self.weights_path
+        if not base:
+            return ""
+        if profile != "clean" and override is None:
+            root, ext = os.path.splitext(base)
+            base = f"{root}_{profile}{ext}"
+        if seed == self.default_seed:
+            return base
+        root, ext = os.path.splitext(base)
         return f"{root}_seed{seed}{ext}"
 
-    def _config(self, seed: int) -> dict:
+    @staticmethod
+    def _embodiment_key(embodiment) -> str:
+        if embodiment is None or embodiment.is_clean:
+            return "clean"
+        return json.dumps(embodiment.to_dict(), sort_keys=True)
+
+    def _config(self, seed: int, profile: str = "clean", embodiment=None) -> dict:
         cfg: Dict[str, Any] = {
             "seed": seed,
             "device": "cpu",
@@ -310,16 +396,26 @@ class Runtime:
             "micro_steps": self.micro_steps,
             "train_on_init": False,
         }
-        weights = self._weights_path(seed)
+        if profile and profile != "clean":
+            cfg["training"] = {
+                "profile": profile,
+                "epochs": self.robust_epochs,
+                "episodes": 3,
+                "episode_steps": 200,
+                "noise_augment": 0.002,
+            }
+        weights = self._weights_path(seed, profile)
         if weights and os.path.isfile(weights):
             cfg["weights_path"] = weights
         elif self.auto_train:
             cfg["train_on_init"] = True
+        if embodiment is not None and not embodiment.is_clean:
+            cfg["embodiment"] = embodiment.to_dict()
         return cfg
 
-    def _build(self, seed: int) -> EngineService:
-        weights = self._weights_path(seed)
-        svc = EngineService(self._config(seed), train=None)
+    def _build(self, seed: int, profile: str = "clean", embodiment=None) -> EngineService:
+        weights = self._weights_path(seed, profile)
+        svc = EngineService(self._config(seed, profile, embodiment), train=None)
         # Persist what we just distilled so later workers/restarts skip training.
         try:
             if (weights and not os.path.isfile(weights)
@@ -330,14 +426,15 @@ class Runtime:
             app.logger.warning("could not cache distilled weights: %s", exc)
         return svc
 
-    def service(self, seed: Optional[int] = None) -> EngineService:
-        """Return (and cache) the engine for *seed*."""
+    def service(self, seed: Optional[int] = None, profile: str = "clean", embodiment=None) -> EngineService:
+        """Return (and cache) the engine for *(seed, profile, embodiment)*."""
         seed = self.default_seed if seed is None else int(seed)
-        key = str(seed)
+        profile = profile or "clean"
+        key = f"{seed}|{profile}|{self._embodiment_key(embodiment)}"
         with self._lock:
             svc = self._engines.get(key)
             if svc is None:
-                svc = self._build(seed)
+                svc = self._build(seed, profile, embodiment)
                 self._engines[key] = svc
             return svc
 
@@ -351,9 +448,12 @@ class Runtime:
         except Exception:  # pragma: no cover - defensive
             return False
 
-    def set_weights(self, path: Optional[str]) -> None:
+    def set_weights(self, path: Optional[str], profile: str = "clean") -> None:
         with self._lock:
-            self.weights_path = path
+            if path:
+                self._weight_overrides[profile] = path
+            else:
+                self._weight_overrides.pop(profile, None)
             self._engines.clear()
 
     # -- reference helpers -------------------------------------------------- #
@@ -361,7 +461,10 @@ class Runtime:
         return engine.reference(steps=steps, radius=radius, freq=freq)
 
     # -- training ----------------------------------------------------------- #
-    def start_training(self, *, epochs: int, n_neurons: Optional[int], seed: int) -> dict:
+    def start_training(
+        self, *, epochs: int, n_neurons: Optional[int], seed: int,
+        profile: str = "clean", embodiment=None,
+    ) -> dict:
         if not self._train_lock.acquire(blocking=False):
             raise BadRequest("a distillation job is already running")
         job_id = uuid.uuid4().hex
@@ -370,6 +473,7 @@ class Runtime:
             "state": "queued",
             "epoch": 0,
             "epochs": int(epochs),
+            "profile": profile,
             "stage": "queued",
             "loss": None,
             "error": None,
@@ -378,19 +482,26 @@ class Runtime:
         }
         thread = threading.Thread(
             target=self._train_worker,
-            args=(job_id, int(epochs), n_neurons, int(seed)),
+            args=(job_id, int(epochs), n_neurons, int(seed), profile,
+                  None if embodiment is None else embodiment.to_dict()),
             daemon=True,
         )
         thread.start()
-        return {"job_id": job_id, "state": "queued", "epochs": int(epochs)}
+        return {"job_id": job_id, "state": "queued", "epochs": int(epochs), "profile": profile}
 
-    def _train_worker(self, job_id: str, epochs: int, n_neurons: Optional[int], seed: int) -> None:
+    def _train_worker(self, job_id: str, epochs: int, n_neurons: Optional[int],
+                      seed: int, profile: str, embodiment_dict: Optional[dict]) -> None:
         from sim_engine import training as training_mod
+        from sim_engine.config import EmbodimentConfig
 
         job = self.job
         try:
             network = NetworkConfig(n_neurons=int(n_neurons) if n_neurons else self.n_neurons)
-            training = TrainingConfig(epochs=epochs, seed=seed, device="cpu")
+            embodiment = EmbodimentConfig(**embodiment_dict) if embodiment_dict else None
+            training = TrainingConfig(
+                epochs=epochs, seed=seed, device="cpu",
+                profile=profile, embodiment=embodiment,
+            )
 
             def log_fn(which: str, epoch: int, loss: float) -> None:
                 if self.job is not None and self.job["id"] == job_id:
@@ -400,10 +511,10 @@ class Runtime:
 
             if job is not None and job["id"] == job_id:
                 job["state"] = "running"
-                job["stage"] = "dense"
-            distilled = training_mod.distill(network, training, log_fn=log_fn)
+                job["stage"] = "data" if profile == "robust" else "dense"
+            distilled = training_mod.distill_profile(profile, network, training, log_fn=log_fn)
 
-            path = self.weights_path or WEIGHTS_PATH
+            path = self._weights_path(seed, profile) or WEIGHTS_PATH
             os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
             training_meta = {
                 "history": distilled["history"],
@@ -416,7 +527,7 @@ class Runtime:
                 connectome=distilled["connectome"],
                 training=training_meta,
             )
-            self.set_weights(path)
+            self.set_weights(path, profile=profile)
 
             if self.job is not None and self.job["id"] == job_id:
                 self.job["state"] = "done"
@@ -461,19 +572,27 @@ def _reference_payload(reference) -> dict:
 
 
 def _run_one(controller: str, *, steps: int, radius: float, freq: float, seed: int,
-             record_spikes: bool, spike_format: str) -> dict:
+             record_spikes: bool, spike_format: str, profile: str = "clean",
+             embodiment: Optional[EmbodimentConfig] = None) -> dict:
     """Run a single controller and return the normalised dashboard payload."""
-    svc = RUNTIME.service(seed)
+    svc = RUNTIME.service(seed, profile, embodiment)
     engine = svc.engine
     canonical = engine.registry.resolve(controller)
     ctrl = engine.build_controller(canonical)
 
     reference = engine.reference(steps=steps, radius=radius, freq=freq)
-    bc = BenchmarkConfig(steps=steps, radius=radius, freq=freq, record_spikes=record_spikes)
+    emb = embodiment or EmbodimentConfig()
+    bc = BenchmarkConfig(steps=steps, radius=radius, freq=freq,
+                         record_spikes=record_spikes, embodiment=emb)
     init_state = torch.tensor(engine.config.plant.init_state, dtype=torch.float32)
 
+    env = None
+    if not emb.is_clean:
+        env = EmbodiedEnv(emb, dt=reference.dt, max_tilt=MAX_TILT,
+                          init_state=engine.config.plant.init_state)
+
     res = run_closed_loop(ctrl, reference=reference, init_state=init_state,
-                          config=bc, name=canonical)
+                          config=bc, name=canonical, env=env)
     result = res.to_dict(include_trace=True)
     spikes = result.pop("spikes", None)
     payload = _spike_payload(spikes, spike_format)
@@ -483,6 +602,7 @@ def _run_one(controller: str, *, steps: int, radius: float, freq: float, seed: i
         "controller": canonical,
         "label": LABELS.get(canonical, canonical),
         "trained": bool(engine.registry.trained),
+        "profile": profile,
         "seed": seed,
         "steps": steps,
         "radius": radius,
@@ -499,19 +619,23 @@ def _run_one(controller: str, *, steps: int, radius: float, freq: float, seed: i
     }
     if payload is not None:
         out["spikes"] = payload
+    out["env"] = None if emb.is_clean else emb.to_dict()
     return out
 
 
 def _run_many(controllers: Sequence[str], *, steps: int, radius: float, freq: float,
               seed: int, record_spikes: bool, spike_format: str,
-              include_trace: bool) -> dict:
+              include_trace: bool, profile: str = "clean",
+              embodiment: Optional[EmbodimentConfig] = None) -> dict:
     """Run several controllers on one shared reference trajectory."""
-    svc = RUNTIME.service(seed)
+    svc = RUNTIME.service(seed, profile, embodiment)
     engine = svc.engine
     names = [engine.registry.resolve(c) for c in controllers]
 
     reference = engine.reference(steps=steps, radius=radius, freq=freq)
-    bc = BenchmarkConfig(steps=steps, radius=radius, freq=freq, record_spikes=record_spikes)
+    emb = embodiment or EmbodimentConfig()
+    bc = BenchmarkConfig(steps=steps, radius=radius, freq=freq,
+                         record_spikes=record_spikes, embodiment=emb)
     init_state = torch.tensor(engine.config.plant.init_state, dtype=torch.float32)
 
     built = {n: engine.build_controller(n) for n in names}
@@ -579,6 +703,8 @@ def _run_many(controllers: Sequence[str], *, steps: int, radius: float, freq: fl
     return {
         "ok": True,
         "trained": trained_registry,
+        "profile": profile,
+        "env": None if emb.is_clean else emb.to_dict(),
         "seed": seed,
         "steps": steps,
         "radius": radius,
@@ -696,6 +822,11 @@ def create_app(config: Optional[Dict[str, Any]] = None) -> Flask:
             weights_path=RUNTIME.weights_path,
             auto_train=RUNTIME.auto_train,
             training=engine_training,
+            profiles=["clean", "robust"],
+            default_profile="clean",
+            embodiment_presets=embodiment_specs(),
+            default_embodiment_preset="embodied",
+            robustness_axes=list(DEFAULT_AXIS_POINTS),
         )
 
     # ------------------------------------------------------------------ #
@@ -718,6 +849,8 @@ def create_app(config: Optional[Dict[str, Any]] = None) -> Flask:
             freq = _as_float(body.get("freq"), "freq", 0.5, 0.0, 10.0)
             record_spikes = _as_bool(body.get("record_spikes"), "record_spikes", True)
             spike_format = _as_spike_format(body)
+            profile = _profile_from_body(body)
+            embodiment = _env_from_body(body)
 
             t0 = time.time()
             if "controllers" in body:
@@ -730,12 +863,14 @@ def create_app(config: Optional[Dict[str, Any]] = None) -> Flask:
                     list(requested), steps=steps, radius=radius, freq=freq, seed=seed,
                     record_spikes=record_spikes, spike_format=spike_format,
                     include_trace=_as_bool(body.get("include_trace"), "include_trace", True),
+                    profile=profile, embodiment=embodiment,
                 )
             else:
                 requested = body.get("controller", "pid")
                 out = _run_one(
                     requested, steps=steps, radius=radius, freq=freq, seed=seed,
                     record_spikes=record_spikes, spike_format=spike_format,
+                    profile=profile, embodiment=embodiment,
                 )
                 out["requested_controller"] = requested
                 out["engine_name"] = out["controller"]
@@ -764,11 +899,14 @@ def create_app(config: Optional[Dict[str, Any]] = None) -> Flask:
             freq = _as_float(body.get("freq"), "freq", 0.5, 0.0, 10.0)
             record_spikes = _as_bool(body.get("record_spikes"), "record_spikes", True)
             spike_format = _as_spike_format(body)
+            profile = _profile_from_body(body)
+            embodiment = _env_from_body(body)
             t0 = time.time()
             out = _run_many(
                 list(requested), steps=steps, radius=radius, freq=freq, seed=seed,
                 record_spikes=record_spikes, spike_format=spike_format,
                 include_trace=_as_bool(body.get("include_trace"), "include_trace", True),
+                profile=profile, embodiment=embodiment,
             )
             out["elapsed_ms"] = round((time.time() - t0) * 1000.0, 3)
             return jsonify(out)
@@ -776,6 +914,45 @@ def create_app(config: Optional[Dict[str, Any]] = None) -> Flask:
             return jsonify(error=str(exc), controllers=CANONICAL_CONTROLLERS), 400
         except (EngineError, KeyError) as exc:
             return jsonify(error=f"unknown controller: {exc}", controllers=CANONICAL_CONTROLLERS), 400
+
+    # ------------------------------------------------------------------ #
+    # POST /api/robustness — environmental sweep
+    # ------------------------------------------------------------------ #
+    @app.post("/api/robustness")
+    def robustness():
+        try:
+            body = _body()
+            axis = str(body.get("axis", "preset")).strip().lower()
+            if axis not in DEFAULT_AXIS_POINTS:
+                raise BadRequest(f"'axis' must be one of: {sorted(DEFAULT_AXIS_POINTS)}")
+            requested = body.get("controllers", ["pid", "flylike_ann", "snn_transferred"])
+            if not isinstance(requested, (list, tuple)) or not requested:
+                raise BadRequest("'controllers' must be a non-empty list")
+            if len(requested) > 5:
+                raise BadRequest("a sweep supports at most 5 controllers")
+            steps = _as_int(body.get("steps"), "steps", 250, 1, MAX_STEPS)
+            seed = _as_int(body.get("seed"), "seed", RUNTIME.default_seed, SEED_MIN, SEED_MAX)
+            radius = _as_float(body.get("radius"), "radius", 0.15, 0.0, 1.0)
+            freq = _as_float(body.get("freq"), "freq", 0.5, 0.0, 10.0)
+            profile = _profile_from_body(body)
+            points = body.get("points")
+            if points is not None and (not isinstance(points, (list, tuple)) or len(points) > MAX_POINTS):
+                raise BadRequest(f"'points' must be a list of at most {MAX_POINTS} items")
+            service = RUNTIME.service(seed, profile)
+            names = [service.engine.registry.resolve(c) for c in requested]
+            cfg = BenchmarkConfig(steps=steps, radius=radius, freq=freq)
+            t0 = time.time()
+            out = robustness_sweep(
+                lambda: {n: service.engine.build_controller(n) for n in names},
+                config=cfg, axis=axis, points=list(points) if points else None, seed=seed,
+            )
+            out["profile"] = profile
+            out["elapsed_ms"] = round((time.time() - t0) * 1000.0, 3)
+            return jsonify(ok=True, **out)
+        except BadRequest as exc:
+            return jsonify(error=str(exc)), 400
+        except (EngineError, KeyError) as exc:
+            return jsonify(error=f"unknown controller: {exc}"), 400
 
     # ------------------------------------------------------------------ #
     # Training / distillation
@@ -788,7 +965,12 @@ def create_app(config: Optional[Dict[str, Any]] = None) -> Flask:
             n_neurons = body.get("n_neurons")
             n_neurons = None if n_neurons is None else _as_int(n_neurons, "n_neurons", RUNTIME.n_neurons, 2, 100000)
             seed = _as_int(body.get("seed"), "seed", RUNTIME.default_seed, SEED_MIN, SEED_MAX)
-            return jsonify(ok=True, **RUNTIME.start_training(epochs=epochs, n_neurons=n_neurons, seed=seed))
+            profile = _profile_from_body(body)
+            embodiment = _env_from_body(body)
+            return jsonify(ok=True, **RUNTIME.start_training(
+                epochs=epochs, n_neurons=n_neurons, seed=seed,
+                profile=profile, embodiment=embodiment,
+            ))
         except BadRequest as exc:
             return jsonify(error=str(exc)), 400
 

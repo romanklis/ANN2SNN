@@ -25,6 +25,11 @@
         <span class="sep"></span>
         <span class="pill pill-idle" id="api-pill">connecting…</span>
         <span class="pill pill-idle" id="trained-pill">untrained</span>
+        <label class="env">
+          <span class="env-label">ENV</span>
+          <select id="env-select" title="Body / environment preset" disabled></select>
+        </label>
+        <span class="pill pill-idle" id="profile-pill">clean</span>
         <span class="capture">
           <button id="record-btn" class="icon-btn" title="Record the experiment (WebM)" disabled>●</button>
           <button id="record-tab-btn" class="icon-btn" title="Record the browser tab (WebM)" disabled>▣</button>
@@ -111,6 +116,7 @@
         <span class="rb-delta">Δ <span id="result-delta">—</span> cm</span>
       </div>
       <div class="rb-note" id="result-note">closed-loop radial tracking error · lower is better</div>
+      <div class="rb-strip" id="robust-strip"></div>
     </footer>
 
     <script type="module" src="./src/main.js"></script>

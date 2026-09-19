@@ -19,7 +19,14 @@ from .physics import (
     SYNAPSES_PER_NEURON,
 )
 
-__all__ = ["PlantConfig", "NetworkConfig", "EngineConfig", "BenchmarkConfig"]
+__all__ = [
+    "PlantConfig",
+    "NetworkConfig",
+    "EmbodimentConfig",
+    "EMBODIMENT_PRESETS",
+    "BenchmarkConfig",
+    "EngineConfig",
+]
 
 
 def _default_init_state() -> Tuple[float, float, float, float]:
@@ -58,6 +65,103 @@ class NetworkConfig:
 
 
 @dataclass
+class EmbodimentConfig:
+    """Sensor / actuator / body / disturbance model of the embodied plant.
+
+    The defaults are the original *clean* benchmark: an ideal sensor, an ideal
+    actuator and the frictionless rolling ball.  Turning any field on makes the
+    body and environment part of the problem rather than a convenient wrapper.
+    """
+
+    #: named preset this was built from (informational)
+    preset: str = "clean"
+    #: master switch; False forces the clean loop
+    enable: bool = True
+
+    # -- sensing ------------------------------------------------------------ #
+    sensor_noise_pos: float = 0.0     # Gaussian sigma on measured position [m]
+    sensor_noise_vel: float = 0.0     # Gaussian sigma on measured velocity [m/s]
+    sensor_delay: int = 0             # observation delay [control frames]
+
+    # -- actuation ---------------------------------------------------------- #
+    actuator_delay: int = 0           # command delay [control frames]
+    actuator_gain: float = 1.0        # command scale
+    actuator_bias: float = 0.0        # command offset [rad]
+
+    # -- body dynamics ------------------------------------------------------ #
+    damping: float = 0.0              # velocity damping b [1/s]  (a -= b*v)
+    c_scale: float = 1.0              # effective body gain C = C_CONST * c_scale
+
+    # -- perturbations ------------------------------------------------------ #
+    process_noise: float = 0.0        # continuous acceleration jitter sigma [m/s^2]
+    impulse_interval: int = 0         # deterministic impulse every N frames (0 = off)
+    impulse_std: float = 0.0          # impulse magnitude sigma [m/s]
+    impulse_prob: float = 0.0         # per-frame random impulse probability
+
+    # -- domain randomisation ---------------------------------------------- #
+    randomize: bool = False
+    c_scale_range: Tuple[float, float] = (0.7, 1.3)
+    damping_range: Tuple[float, float] = (0.0, 0.8)
+
+    seed: int = 0
+
+    @property
+    def is_clean(self) -> bool:
+        """True when this configuration is exactly the original clean benchmark."""
+        if not self.enable:
+            return True
+        return (
+            self.sensor_noise_pos == 0.0
+            and self.sensor_noise_vel == 0.0
+            and self.sensor_delay == 0
+            and self.actuator_delay == 0
+            and self.actuator_gain == 1.0
+            and self.actuator_bias == 0.0
+            and self.damping == 0.0
+            and self.c_scale == 1.0
+            and self.process_noise == 0.0
+            and self.impulse_interval == 0
+            and self.impulse_std == 0.0
+            and self.impulse_prob == 0.0
+            and not self.randomize
+        )
+
+    @classmethod
+    def from_preset(cls, name: str) -> "EmbodimentConfig":
+        if name not in EMBODIMENT_PRESETS:
+            raise ValueError(
+                f"unknown embodiment preset {name!r}; "
+                f"expected one of {sorted(EMBODIMENT_PRESETS)}"
+            )
+        return cls(preset=name, **EMBODIMENT_PRESETS[name])
+
+    def to_dict(self) -> dict:
+        return dataclasses.asdict(self)
+
+
+#: Named embodiment presets.  ``clean`` is the original benchmark; ``embodied``
+#: is the default story setting (mild noise + delay + impulses + a lossy body).
+EMBODIMENT_PRESETS: Dict[str, dict] = {
+    "clean": {},
+    "noisy": {"sensor_noise_pos": 0.005, "sensor_noise_vel": 0.02},
+    "delayed": {"sensor_delay": 3, "actuator_delay": 2},
+    "perturbed": {"impulse_interval": 60, "impulse_std": 0.15},
+    "heavy": {"damping": 0.6, "c_scale": 0.8},
+    "embodied": {
+        "sensor_noise_pos": 0.004,
+        "sensor_noise_vel": 0.015,
+        "sensor_delay": 2,
+        "actuator_delay": 1,
+        "impulse_interval": 80,
+        "impulse_std": 0.12,
+        "damping": 0.3,
+        "c_scale": 0.9,
+    },
+    "randomized": {"randomize": True},
+}
+
+
+@dataclass
 class BenchmarkConfig:
     """Closed-loop trajectory-evaluation parameters."""
 
@@ -65,6 +169,7 @@ class BenchmarkConfig:
     radius: float = 0.15
     freq: float = 0.5
     record_spikes: bool = True
+    embodiment: EmbodimentConfig = field(default_factory=EmbodimentConfig)
 
     def to_dict(self) -> dict:
         return dataclasses.asdict(self)
@@ -82,6 +187,15 @@ class TrainingConfig:
     log_every: int = 25
     device: str = "cpu"
     seed: int = 42
+    #: "clean" = the original i.i.d. error sampling; "robust" = distill the PD
+    #: teacher *inside* an embodied environment (noise + delay + perturbations).
+    profile: str = "clean"
+    #: embodiment used for the robust profile (None -> preset "embodied")
+    embodiment: Optional[EmbodimentConfig] = None
+    #: robust data generation
+    episodes: int = 4
+    episode_steps: int = 250
+    noise_augment: float = 0.0
 
     def to_dict(self) -> dict:
         return dataclasses.asdict(self)
@@ -132,6 +246,18 @@ class EngineConfig:
     batch_size: Optional[int] = None
     lr: Optional[float] = None
 
+    # -- embodiment convenience overrides ----------------------------------- #
+    #: full embodiment config (takes precedence over the flat fields below)
+    embodiment: Optional[EmbodimentConfig] = None
+    embodiment_preset: Optional[str] = None
+    sensor_noise_pos: Optional[float] = None
+    sensor_noise_vel: Optional[float] = None
+    sensor_delay: Optional[int] = None
+    actuator_delay: Optional[int] = None
+    disturbance_std: Optional[float] = None   # -> process_noise
+    damping: Optional[float] = None
+    c_scale: Optional[float] = None
+
     def __post_init__(self) -> None:
         b, n, p, t = self.benchmark, self.network, self.plant, self.training
         if self.steps is not None:
@@ -160,6 +286,29 @@ class EngineConfig:
             t.batch_size = int(self.batch_size)
         if self.lr is not None:
             t.lr = float(self.lr)
+
+        # Embodiment: an explicit config wins, otherwise a preset + flat fields.
+        flat = (self.sensor_noise_pos, self.sensor_noise_vel, self.sensor_delay,
+                self.actuator_delay, self.disturbance_std, self.damping, self.c_scale)
+        if self.embodiment is not None:
+            b.embodiment = self.embodiment
+        elif self.embodiment_preset is not None or any(v is not None for v in flat):
+            cfg = EmbodimentConfig.from_preset(self.embodiment_preset or "clean")
+            if self.sensor_noise_pos is not None:
+                cfg.sensor_noise_pos = float(self.sensor_noise_pos)
+            if self.sensor_noise_vel is not None:
+                cfg.sensor_noise_vel = float(self.sensor_noise_vel)
+            if self.sensor_delay is not None:
+                cfg.sensor_delay = int(self.sensor_delay)
+            if self.actuator_delay is not None:
+                cfg.actuator_delay = int(self.actuator_delay)
+            if self.disturbance_std is not None:
+                cfg.process_noise = float(self.disturbance_std)
+            if self.damping is not None:
+                cfg.damping = float(self.damping)
+            if self.c_scale is not None:
+                cfg.c_scale = float(self.c_scale)
+            b.embodiment = cfg
 
     def to_dict(self) -> dict:
         d = dataclasses.asdict(self)

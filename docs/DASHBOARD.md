@@ -139,11 +139,12 @@ All responses are JSON; the API never leaks torch tensors.
 | Method | Route | Purpose |
 |---|---|---|
 | `GET` | `/api/health` | liveness + versions + `trained` |
-| `GET` | `/api/controllers` | catalogue (`catalog`) + geometry/defaults |
+| `GET` | `/api/controllers` | catalogue (`catalog`) + geometry/defaults + `embodiment_presets`/`profiles`/`robustness_axes` |
 | `GET` | `/api/engine` | full `Engine.describe()` |
-| `POST` | `/api/simulate` | single controller (or `{"controllers": [...]}`) |
-| `POST` | `/api/benchmark` | multi-controller comparison on one reference |
-| `POST` | `/api/train` | start behavioural distillation (background job) |
+| `POST` | `/api/simulate` | single controller (or `{"controllers": [...]}`); accepts `embodiment` + `profile` |
+| `POST` | `/api/benchmark` | multi-controller comparison on one reference; accepts `embodiment` + `profile` |
+| `POST` | `/api/robustness` | environmental sweep (`axis` = `preset\|noise\|delay\|impulse`) |
+| `POST` | `/api/train` | start distillation for a `profile` (`clean`\|`robust`) |
 | `GET` | `/api/train/<job_id>` | `{state, stage, epoch, epochs, loss, error}` |
 | `POST` | `/api/export/mp4` | render + download one MP4 (bounded steps) |
 | `POST` | `/api/sessions` | create an interactive stepping session |
@@ -215,6 +216,11 @@ every panel.
   API/trained badges.
 * **Result bar (footer)** — `TRANSFER EXPERIMENT`: fly-like ANN error ·
   SNN error · `Δ = SNN − ANN` (neutral wording, no winner).
+* **Environment selector (header)** — `Clean · Noisy · Delayed · Perturbed · Heavy ·
+  Embodied · Randomized` (default **Embodied**) with a `clean`/`robust` policy pill;
+  selecting an embodied preset switches to the robust policy (auto-distilled and
+  cached). A footer **robustness strip** shows the ANN/SNN mean error across every
+  preset. See [`EMBODIMENT.md`](EMBODIMENT.md).
 * **Capture (header icons)** — `●` records the stage-only WebM; `▣` records the
   whole browser tab; `⤓` downloads a server-rendered MP4 of the SNN.
 

@@ -301,6 +301,54 @@ def test_session_manual_action(client):
 
 
 # --------------------------------------------------------------------------- #
+# embodiment / profile / robustness
+# --------------------------------------------------------------------------- #
+def test_controllers_expose_embodiment(client):
+    body = client.get("/api/controllers").get_json()
+    assert "clean" in body["profiles"] and "robust" in body["profiles"]
+    assert "embodied" in body["embodiment_presets"]
+    assert "delay" in body["robustness_axes"]
+
+
+def test_simulate_with_embodiment_and_profile(client):
+    r = client.post("/api/simulate", json={
+        "controller": "pid", "steps": 40, "embodiment": "noisy", "profile": "clean",
+    })
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["env"]["preset"] == "noisy"
+    assert body["profile"] == "clean"
+    assert body["metrics"]["on_plate_pct"] >= 0.0
+
+
+def test_embodiment_validation(client):
+    assert client.post("/api/simulate", json={"embodiment": {"sensor_delay": 999}}).status_code == 400
+    assert client.post("/api/simulate", json={"embodiment": "not-a-preset"}).status_code == 400
+    assert client.post("/api/simulate", json={"profile": "bogus"}).status_code == 400
+
+
+def test_benchmark_embodied_metrics(client):
+    r = client.post("/api/benchmark", json={
+        "controllers": ["pid", "random_ann"], "steps": 130, "embodiment": "perturbed",
+    })
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["env"]["preset"] == "perturbed"
+    assert body["stats"]["per_controller"]["pid"]["impulse_count"] == 2
+
+
+def test_robustness_endpoint(client):
+    r = client.post("/api/robustness", json={
+        "controllers": ["pid"], "axis": "delay", "steps": 40, "points": [0, 1],
+    })
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["axis"] == "delay"
+    assert len(body["cells"]) == 2
+    assert body["cells"][0]["per_controller"]["pid"]["mean_error_cm"] > 0
+
+
+# --------------------------------------------------------------------------- #
 # distillation job (tiny network; restores runtime state)
 # --------------------------------------------------------------------------- #
 def test_train_job_runs_and_registers_weights(client):

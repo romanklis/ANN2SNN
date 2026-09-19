@@ -55,6 +55,8 @@ os.environ.setdefault("MPLCONFIGDIR", "/tmp/mplconfig")
 
 import numpy as np  # noqa: E402
 
+from sim_engine.config import EMBODIMENT_PRESETS  # noqa: E402
+
 try:  # running as a script (`python3 tools/generate_videos.py`)
     from render import (  # type: ignore
         DEFAULT_COLORS,
@@ -192,7 +194,7 @@ def _write_status(outdir: str, status: dict) -> None:
 
 def _build_engine(args):
     """Construct a :class:`sim_engine.engine.Engine` per the CLI flags."""
-    from sim_engine.config import EngineConfig
+    from sim_engine.config import EmbodimentConfig, EngineConfig, TrainingConfig
     from sim_engine.engine import Engine
 
     weights = args.weights
@@ -211,6 +213,14 @@ def _build_engine(args):
     )
     if args.n_neurons:
         overrides["n_neurons"] = args.n_neurons
+    if getattr(args, "embodiment", None):
+        overrides["embodiment_preset"] = args.embodiment
+    if getattr(args, "profile", "clean") == "robust":
+        overrides["training"] = TrainingConfig(
+            profile="robust",
+            epochs=args.epochs,
+            embodiment=EmbodimentConfig.from_preset(args.embodiment or "embodied"),
+        )
     cfg = EngineConfig(**overrides)
     engine = Engine(cfg, train=(True if (args.train and not weights) else None))
 
@@ -242,6 +252,10 @@ def main() -> int:
                     help="load a weights bundle instead of distilling")
     ap.add_argument("--save-weights", default="weights.pt",
                     help="where to save distilled weights when training")
+    ap.add_argument("--embodiment", default=None, choices=sorted(EMBODIMENT_PRESETS),
+                    help="embodied environment preset for the closed loop")
+    ap.add_argument("--profile", default="clean", choices=["clean", "robust"],
+                    help="distillation profile (robust = train inside the environment)")
     ap.add_argument("--fps", type=int, default=30)
     ap.add_argument("--dpi", type=int, default=100)
     ap.add_argument("--stride", type=int, default=1,
@@ -292,8 +306,13 @@ def main() -> int:
     # -- reference + config -------------------------------------------------- #
     reference = orbit_reference(steps=args.steps, radius=args.radius,
                                 freq=args.freq, device="cpu")
+    from sim_engine.config import EmbodimentConfig
+    from sim_engine.environment import EmbodiedEnv
+
+    embodiment = (EmbodimentConfig.from_preset(args.embodiment)
+                  if getattr(args, "embodiment", None) else EmbodimentConfig())
     config = BenchmarkConfig(steps=args.steps, radius=args.radius, freq=args.freq,
-                             record_spikes=True)
+                             record_spikes=True, embodiment=embodiment)
     init_state = torch.tensor([-0.05, 0.05, 0.0, 0.0])
     ref_npz = os.path.join(args.cache_dir, "reference.npz")
     np.savez(ref_npz, ref_pos=reference.pos.cpu().numpy(),
@@ -325,8 +344,12 @@ def main() -> int:
             if reuse and os.path.exists(npz):
                 continue
             ctrl = engine.build_controller(key)
+            env = None
+            if not embodiment.is_clean:
+                env = EmbodiedEnv(embodiment, dt=reference.dt, max_tilt=MAX_TILT,
+                                  init_state=init_state)
             res = run_closed_loop(ctrl, reference=reference, init_state=init_state,
-                                  config=config, name=label)
+                                  config=config, name=label, env=env)
             Rollout(
                 name=key,
                 trajectory=np.asarray(res.trajectory),
@@ -417,6 +440,10 @@ def main() -> int:
             "freq": args.freq, "duration_s": round(args.steps * DT, 3),
             "init_state": [float(v) for v in init_state],
             "plate_half_m": args.plate_half, "max_tilt_rad": MAX_TILT,
+        },
+        "environment": {
+            "preset": getattr(args, "embodiment", None) or "clean",
+            "profile": getattr(args, "profile", "clean"),
         },
         "video": {"fps": args.fps, "dpi": args.dpi, "stride": args.stride,
                   "codec": "H.264 / libx264 / yuv420p"},

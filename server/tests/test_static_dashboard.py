@@ -65,7 +65,8 @@ def test_single_screen_layout(built_index: Path):
     for required in ("stage", "spikes", "control-out", "tracking",
                      "controller-pipeline", "result-ann", "result-snn",
                      "result-delta", "play-btn", "api-pill", "trained-pill",
-                     "record-btn", "export-btn"):
+                     "record-btn", "export-btn", "env-select", "profile-pill",
+                     "robust-strip"):
         assert f'id="{required}"' in html, f"missing #{required}"
     for removed in ("controller", "seed", "compare-all-btn", "ranking-table",
                     "err-chart", "tilt-chart", "meta-body", "run-form",

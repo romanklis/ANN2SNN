@@ -37,6 +37,9 @@ DT: float = 0.02
 MAX_TILT: float = 0.25
 """Actuator saturation: maximum plate angle [rad] (~14.3 degrees)."""
 
+PLATE_HALF: float = 0.25
+"""Half-side of the physical plate [m]; a ball beyond this has left the plate."""
+
 # --------------------------------------------------------------------------- #
 # Network dimensions
 # --------------------------------------------------------------------------- #
@@ -73,6 +76,8 @@ def step_physics(
     dt: float = DT,
     max_tilt: float = MAX_TILT,
     c_const: float = C_CONST,
+    damping: float = 0.0,
+    disturbance: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Advance the ball-and-plate plant by one timestep.
 
@@ -87,6 +92,12 @@ def step_physics(
     dt, max_tilt, c_const:
         Overrides for the physical constants; the defaults are the canonical
         values exported by this module.
+    damping:
+        Velocity damping ``b`` [1/s]; the body term is ``a -= b * v``.  The
+        default ``0.0`` leaves the original frictionless model untouched.
+    disturbance:
+        Optional ``[dx, dy]`` external acceleration [m/s^2] applied this step
+        (perturbations / process noise).  Default ``None`` = no disturbance.
 
     Returns
     -------
@@ -99,6 +110,17 @@ def step_physics(
     # dv/dt = -C * theta  (per axis)
     ax = -c_const * tilt_clamped[0]
     ay = -c_const * tilt_clamped[1]
+
+    # Optional body damping (a -= b * v).  Guarded so damping=0 is bit-exact.
+    if damping:
+        ax = ax - damping * state[2]
+        ay = ay - damping * state[3]
+
+    # Optional external disturbance acceleration.
+    if disturbance is not None:
+        d = torch.as_tensor(disturbance, dtype=state.dtype, device=state.device)
+        ax = ax + d[0]
+        ay = ay + d[1]
 
     vx_next = state[2] + ax * dt
     vy_next = state[3] + ay * dt
@@ -141,6 +163,7 @@ class BallPlatePlant:
         dt: float = DT,
         max_tilt: float = MAX_TILT,
         c_const: float = C_CONST,
+        damping: float = 0.0,
         device="cpu",
         dtype=torch.float32,
     ) -> None:
@@ -148,6 +171,7 @@ class BallPlatePlant:
         self.dt = dt
         self.max_tilt = max_tilt
         self.c_const = c_const
+        self.damping = damping
         self.device = torch.device(device)
         self.dtype = dtype
         self.state = self.init_state.clone()
@@ -159,11 +183,17 @@ class BallPlatePlant:
         self.t = 0
         return self.state.clone()
 
-    def step(self, tilt: torch.Tensor) -> torch.Tensor:
+    def step(self, tilt: torch.Tensor, disturbance: torch.Tensor | None = None) -> torch.Tensor:
         """Apply one actuator command and advance the plant by ``dt``."""
         tilt = torch.as_tensor(tilt, dtype=self.dtype, device=self.device)
         self.state = step_physics(
-            self.state, tilt, dt=self.dt, max_tilt=self.max_tilt, c_const=self.c_const
+            self.state,
+            tilt,
+            dt=self.dt,
+            max_tilt=self.max_tilt,
+            c_const=self.c_const,
+            damping=self.damping,
+            disturbance=disturbance,
         )
         self.t += 1
         return self.state.clone()
