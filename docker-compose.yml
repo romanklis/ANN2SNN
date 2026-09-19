@@ -1,0 +1,28 @@
+# One-command local run of the self-contained dashboard image:
+#
+#   mkdir -p videos            # host writable by the container's `app` user
+#   docker compose up --build  # then open http://localhost:8080
+#
+# `videos/` receives server-rendered MP4s and the cached weights bundle lives in
+# the `ann2snn-weights` volume.
+
+services:
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ann2snn-dashboard:latest
+    container_name: ann2snn-dashboard
+    ports:
+      - "${PORT:-8080}:8080"
+    environment:
+      ANN2SNN_THREADS: "2"
+      ANN2SNN_WORKERS: "2"
+      ANN2SNN_WEIGHTS: /app/data/weights.pt
+    volumes:
+      - ./videos:/app/videos
+      - ann2snn-weights:/app/data
+    restart: unless-stopped
+
+volumes:
+  ann2snn-weights:

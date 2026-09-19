@@ -1,0 +1,18 @@
+{
+  "name": "ann2snn-dashboard",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Interactive browser dashboard for the ANN2SNN ball-and-plate simulator (vanilla JS + Plotly, bundled with Vite).",
+  "type": "module",
+  "scripts": {
+    "build": "vite build",
+    "dev": "vite",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "plotly.js-basic-dist-min": "^2.35.2"
+  },
+  "devDependencies": {
+    "vite": "^5.4.10"
+  }
+}

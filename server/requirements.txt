@@ -1,0 +1,7 @@
+# Web layer for the ANN2SNN dashboard.
+# torch/numpy come from the engine (see pyproject.toml); matplotlib is only
+# needed by the server-side MP4 exporter (tools/render.py).
+flask>=3.0
+flask-cors>=4.0
+gunicorn>=21.0
+matplotlib>=3.6

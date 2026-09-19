@@ -73,6 +73,35 @@ python -m sim_engine session --controller snn_transferred --frames 20 --verbose
 `python -m sim_engine benchmark --train` distils the ANNs in-memory before
 evaluating; `--weights weights.pt` reuses a saved bundle.
 
+## Interactive dashboard & demo videos
+
+A browser dashboard over `sim_engine` lives in `server/` (Flask API) + `web/`
+(Vite + Plotly frontend), with a matplotlib/ffmpeg MP4 renderer in `tools/`.
+It animates the ball on the plate, ranks **all solutions** on one shared orbit
+(leaderboard + aggregate statistics), shows a **model guide** (how each brain was
+obtained and trained), distils and caches the learned brains, and records demo
+clips (in-page WebM or server MP4).
+
+```bash
+make install          # one-time: pip install -e ".[dashboard,video,dev]"
+make up               # build the frontend + serve the dashboard on :8080
+```
+
+Other useful targets: `make test`, `make videos-train`
+(`videos/01_random_ann.mp4 … all_controllers_sequence.mp4`), `make help`.
+
+For anyone without that environment, the same solution comes up in a container:
+
+```bash
+make up-docker        # plain docker build + run, auto-picking a free host port
+make docker-run       # same (build + run), or use: make compose-up PORT=9000
+```
+
+No `docker compose` or BuildKit/buildx is required; `make up-docker` finds a free
+host port and prints the URL. See
+[`docs/DASHBOARD.md`](docs/DASHBOARD.md) for the API, frontend behaviour,
+recording workflow, the DinD image recipe and the standalone Docker image.
+
 ## The reusable API (for the web backend)
 
 `sim_engine.api.EngineService` is the transport-agnostic seam a Flask/FastAPI
@@ -119,6 +148,12 @@ sim_engine/
 ├── serialization.py    # tensor/numpy -> JSON helpers
 └── cli.py / __main__.py
 examples/run_benchmark.py
+
+server/                  # Flask API over sim_engine.api.EngineService
+web/                     # Vite + Plotly dashboard (builds into server/static)
+tools/                   # matplotlib + ffmpeg MP4 renderer and CLI
+docs/DASHBOARD.md        # dashboard/API/video documentation
+Makefile                 # install / test / web-build / serve / videos
 ```
 
 ### Design rules

@@ -5,6 +5,8 @@ __pycache__/
 build/
 dist/
 .eggs/
+.kilo
+new elements/
 
 # Tooling / caches
 .pytest_cache/
@@ -22,3 +24,17 @@ venv/
 weights.pt
 results.json
 *.png
+
+# Dashboard / frontend
+web/node_modules/
+web/dist/
+web/.vite/
+server/static/
+.cache/
+npm-debug.log*
+
+# Rendered videos
+videos/
+*.mp4
+*.webm
+!new elements/**/*.mp4

@@ -249,14 +249,16 @@ def save_weights(
 def load_weights(path: str, device="cpu") -> dict:
     """Load a bundle produced by :func:`save_weights` (``weights_only=False``).
 
-    Returns ``{"dense": ..., "connectome": ...}`` with freshly constructed
-    controllers that already hold the saved weights.
+    Returns ``{"dense": ..., "connectome": ..., "training": ...}`` with freshly
+    constructed controllers that already hold the saved weights.  ``training`` is
+    the optional metadata saved alongside the weights (loss history, final loss
+    and the :class:`TrainingConfig`), or ``None`` for older bundles.
     """
     bundle = torch.load(path, map_location=device, weights_only=False)
     if bundle.get("format") != "ann2snn.sim_engine.weights@1":
         raise ValueError(f"unrecognised weights bundle format: {bundle.get('format')!r}")
 
-    out: Dict[str, object] = {}
+    out: Dict[str, object] = {"training": bundle.get("training")}
     if "dense" in bundle:
         meta = bundle["dense"]
         ctrl = DenseNNController(

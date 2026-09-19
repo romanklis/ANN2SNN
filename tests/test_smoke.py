@@ -200,3 +200,29 @@ def test_weights_roundtrip(tmp_path):
     loaded = load_weights(path)
     x = torch.tensor([0.01, 0.02, 0.03, 0.04])
     assert torch.allclose(d.act(x, _ref()), loaded["dense"].act(x, _ref()), atol=1e-6)
+
+
+def test_loaded_bundle_exposes_training_metadata(tmp_path):
+    from sim_engine.training import load_weights, save_weights
+
+    d = DenseNNController(n_neurons=32, seed=1)
+    c = ConnectomeANNController(n_neurons=32, synapses_per_neuron=4, seed=1)
+    path = str(tmp_path / "w.pt")
+    training = {
+        "history": {"dense": [1.0, 0.5], "connectome": [2.0, 1.0]},
+        "final_loss": {"dense": 0.5, "connectome": 1.0},
+        "config": TrainingConfig(epochs=2, seed=7).to_dict(),
+    }
+    save_weights(path, dense=d, connectome=c, training=training)
+
+    loaded = load_weights(path)
+    assert loaded["training"]["final_loss"]["dense"] == 0.5
+
+    engine = Engine(EngineConfig(weights_path=path, n_neurons=32, device="cpu"))
+    desc = engine.describe()
+    assert desc["trained"] is True
+    # provenance survives the load, so the dashboard can show "how it was trained"
+    assert desc["training"] is not None
+    assert desc["training"]["final_loss"]["dense"] == 0.5
+    assert desc["training"]["config"]["seed"] == 7
+    assert desc["training"]["epochs_logged"] == 2

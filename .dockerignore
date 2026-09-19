@@ -1,0 +1,35 @@
+# Keep the build context small and hermetic.
+.git
+.gitignore
+.kilo
+.vscode
+.idea
+new elements
+videos
+data
+*.pt
+*.mp4
+*.webm
+*.png
+*.Zone.Identifier
+
+# Python
+__pycache__
+**/__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.venv
+venv
+
+# Node / built assets (rebuilt inside the image)
+web/node_modules
+web/dist
+server/static
+
+# Docker build files (not needed inside)
+Dockerfile
+docker-compose.yml
+.dockerignore

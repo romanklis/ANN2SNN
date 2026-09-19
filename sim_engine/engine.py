@@ -64,11 +64,13 @@ class Engine:
 
         dense = connectome = None
         trained = False
+        loaded_training = None
 
         if self.config.weights_path:
             loaded = training_mod.load_weights(self.config.weights_path, device=self.device)
             dense = loaded.get("dense")
             connectome = loaded.get("connectome")
+            loaded_training = loaded.get("training")
             trained = dense is not None and connectome is not None
 
         do_train = self.config.train_on_init if train is None else train
@@ -85,7 +87,8 @@ class Engine:
             }
             trained = True
         else:
-            self.last_training = None
+            # Keep the provenance saved with a loaded bundle (how it was trained).
+            self.last_training = loaded_training if trained else None
 
         self.registry = ControllerRegistry(
             self.config.network,
@@ -201,9 +204,11 @@ class Engine:
                     None
                     if self.last_training is None
                     else {
-                        "final_loss": self.last_training["final_loss"],
-                        "config": self.last_training["config"],
-                        "epochs_logged": len(self.last_training["history"]["dense"]),
+                        "final_loss": self.last_training.get("final_loss"),
+                        "config": self.last_training.get("config"),
+                        "epochs_logged": len(
+                            self.last_training.get("history", {}).get("dense", [])
+                        ),
                     }
                 ),
             }

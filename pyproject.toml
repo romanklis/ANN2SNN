@@ -17,6 +17,12 @@ dependencies = [
 [project.optional-dependencies]
 plot = ["matplotlib>=3.6"]
 dev = ["pytest>=7.0"]
+dashboard = [
+    "flask>=3.0",
+    "flask-cors>=4.0",
+    "gunicorn>=21.0",
+]
+video = ["matplotlib>=3.6"]
 
 [project.scripts]
 sim-engine = "sim_engine.cli:main"
