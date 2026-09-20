@@ -13,9 +13,11 @@ The identical schedule is applied to the dense ANN and to the sparse recurrent
 connectome ANN (unrolled ``connectome_unroll`` recurrent steps), which is what
 lets us later transfer the connectome ANN into the SNN.
 
-The teacher's feed-forward acceleration term is deliberately omitted from the
-labels — it depends on the reference trajectory, not on the error, and the
-prototype trained the students on error-only inputs.
+The policy input is ``[e, u_ff]`` (6-D): the tracking error plus the feed-forward
+command ``u_ff = -a_ref/C`` reconstructed from the Kalman estimate (position-only
+camera, known rolling gain).  Labels reproduce the **full** analytic teacher
+``kp*e + kd*e_dot + u_ff``, so the learned arms are trained on the same channel the
+PID reference arm uses.
 """
 
 from __future__ import annotations
@@ -29,14 +31,15 @@ import torch.optim as optim
 
 from .config import BenchmarkConfig, EmbodimentConfig, NetworkConfig, TrainingConfig
 from .controllers import ClassicalPDController, ConnectomeANNController, DenseNNController
-from .controllers.base import error_vector
+from .controllers.base import ReferenceAccelEstimator, error_vector
 from .environment import EmbodiedEnv
 from .estimators import KalmanFilter
-from .physics import MAX_TILT, SYNAPSES_PER_NEURON
+from .physics import MAX_TILT, N_IN, SYNAPSES_PER_NEURON
 from .reference import orbit_reference
 
 __all__ = [
     "sample_errors",
+    "sample_policy_inputs",
     "pd_target",
     "train_dense_controller",
     "train_connectome_controller",
@@ -68,15 +71,43 @@ def sample_errors(
     return (torch.rand(batch_size, n_in, device=device, dtype=dtype) - 0.5) * error_scale
 
 
+def sample_policy_inputs(
+    batch_size: int = 64,
+    error_scale: float = 0.4,
+    n_in: int = N_IN,
+    device="cpu",
+    dtype=torch.float32,
+    ff_scale: float = MAX_TILT,
+) -> torch.Tensor:
+    """Random policy-input batch ``[e, u_ff]``.
+
+    The first four columns are uniform tracking errors; when ``n_in >= 6`` the
+    last two are a uniform feed-forward command in ``[-ff_scale, +ff_scale]`` so
+    training covers both channels.
+    """
+    errs = sample_errors(batch_size, error_scale, min(n_in, 4), device, dtype)
+    if n_in <= 4:
+        return errs
+    ff = (torch.rand(batch_size, n_in - 4, device=device, dtype=dtype) * 2.0 - 1.0) * ff_scale
+    return torch.cat([errs, ff], dim=1)
+
+
 @torch.no_grad()
 def pd_target(
-    errors: torch.Tensor,
+    inputs: torch.Tensor,
     teacher: ClassicalPDController,
 ) -> torch.Tensor:
-    """PD feedback label for a batch of errors: ``(B, 2)`` saturated commands."""
+    """PD label for a batch of policy inputs: ``(B, 2)`` saturated commands.
+
+    Matches the analytic teacher exactly: ``kp*e + kd*ė + u_ff`` (the feed-forward
+    columns are the reconstructed reference acceleration command).
+    """
     kp, kd = teacher.kp, teacher.kd
-    tx = kp * errors[:, 0] + kd * errors[:, 2]
-    ty = kp * errors[:, 1] + kd * errors[:, 3]
+    tx = kp * inputs[:, 0] + kd * inputs[:, 2]
+    ty = kp * inputs[:, 1] + kd * inputs[:, 3]
+    if inputs.shape[1] >= 6:
+        tx = tx + inputs[:, 4]
+        ty = ty + inputs[:, 5]
     return torch.stack([tx, ty], dim=1).clamp(-teacher.max_tilt, teacher.max_tilt)
 
 
@@ -100,11 +131,11 @@ def train_dense_controller(
 
     controller.train()
     for epoch in range(1, config.epochs + 1):
-        errs = sample_errors(config.batch_size, config.error_scale, controller.n_in, device, dtype)
-        targets = pd_target(errs, teacher)
+        inputs = sample_policy_inputs(config.batch_size, config.error_scale, controller.n_in, device, dtype)
+        targets = pd_target(inputs, teacher)
 
         opt.zero_grad()
-        pred = controller.net(errs)  # unsaturated head; loss sees the raw output
+        pred = controller.net(inputs)  # unsaturated head; loss sees the raw output
         loss = criterion(pred.clamp(-controller.max_tilt, controller.max_tilt), targets)
         loss.backward()
         opt.step()
@@ -136,7 +167,7 @@ def train_connectome_controller(
 
     controller.train()
     for epoch in range(1, config.epochs + 1):
-        errs = sample_errors(config.batch_size, config.error_scale, controller.n_in, device, dtype)
+        errs = sample_policy_inputs(config.batch_size, config.error_scale, controller.n_in, device, dtype)
         targets = pd_target(errs, teacher)
 
         opt.zero_grad()
@@ -255,23 +286,27 @@ def generate_closed_loop_episodes(
     )
 
     episodes = []
+    ff_est = ReferenceAccelEstimator(dt=ref.dt)
     for ep in range(int(config.episodes)):
         env.reset(seed=int(config.seed) + ep)
         kf.reset()
+        ff_est.reset()
         state = torch.tensor([-0.05, 0.05, 0.0, 0.0], dtype=torch.float32, device=config.device)
         u_prev = torch.zeros(2, dtype=torch.float32, device=config.device)
-        errs, labels = [], []
+        inputs, labels = [], []
         with torch.no_grad():
             for k in range(steps):
                 y = env.measure(state)                    # camera: position only
                 xhat = kf.update(y, u_prev)               # Kalman estimate
-                err = error_vector(xhat, ref.at(k))       # teacher sees r − x̂
-                errs.append(err)
-                labels.append(pd_target(err.unsqueeze(0), teacher)[0])
-                u = teacher.act(xhat, ref.at(k))
+                err = error_vector(xhat, ref.at(k))       # e = x̂ − r
+                u_ff = ff_est.update(xhat, ref.at(k))     # KF-reconstructed feed-forward
+                inp = torch.cat([err, u_ff])              # policy input [e, u_ff]
+                inputs.append(inp)
+                labels.append(pd_target(inp.unsqueeze(0), teacher)[0])
+                u = teacher.act(xhat, ref.at(k))          # analytic teacher, full law
                 state = env.step(state, env.actuate(u), k)
                 u_prev = u
-        episodes.append({"errors": torch.stack(errs), "labels": torch.stack(labels)})
+        episodes.append({"inputs": torch.stack(inputs), "labels": torch.stack(labels)})
         if log_fn:
             log_fn("data", ep + 1, 0.0)
     return episodes
@@ -293,7 +328,7 @@ def train_dense_embodied(
     criterion = nn.MSELoss()
     history: List[float] = []
 
-    errs = torch.cat([e["errors"] for e in episodes]).to(device, dtype)
+    errs = torch.cat([e["inputs"] for e in episodes]).to(device, dtype)
     labels = torch.cat([e["labels"] for e in episodes]).to(device, dtype)
     n = int(errs.shape[0])
     if n == 0:
@@ -336,7 +371,7 @@ def train_connectome_embodied(
 
     windows = []
     for e in episodes:
-        errs_e, labels_e = e["errors"], e["labels"]
+        errs_e, labels_e = e["inputs"], e["labels"]
         if errs_e.shape[0] < W:
             continue
         if errs_e.shape[0] == W:
@@ -452,11 +487,11 @@ def distill_closed_loop(
     # errors, so add i.i.d. samples labelled by the same PD law. Without this the
     # student never learns the large-error corrections it needs to recover.
     if int(config.coverage_samples) > 0:
-        extra = sample_errors(
+        extra = sample_policy_inputs(
             int(config.coverage_samples), config.error_scale,
             network.n_in, device, next(dense.parameters()).dtype,
         )
-        episodes.append({"errors": extra, "labels": pd_target(extra, teacher)})
+        episodes.append({"inputs": extra, "labels": pd_target(extra, teacher)})
 
     dense_hist = train_dense_embodied(dense, episodes, config, log_fn=log_fn)
     conn_hist = train_connectome_embodied(connectome, episodes, config, log_fn=log_fn)
@@ -506,7 +541,7 @@ def save_weights(
     training: Optional[dict] = None,
 ) -> str:
     """Persist trained controller weights to a single ``.pt`` bundle."""
-    bundle = {"format": "ann2snn.sim_engine.weights@1"}
+    bundle = {"format": "ann2snn.sim_engine.weights@2"}
     if dense is not None:
         bundle["dense"] = {
             "state_dict": dense.state_dict(),
@@ -541,8 +576,13 @@ def load_weights(path: str, device="cpu") -> dict:
     and the :class:`TrainingConfig`), or ``None`` for older bundles.
     """
     bundle = torch.load(path, map_location=device, weights_only=False)
-    if bundle.get("format") != "ann2snn.sim_engine.weights@1":
-        raise ValueError(f"unrecognised weights bundle format: {bundle.get('format')!r}")
+    fmt = bundle.get("format")
+    if fmt != "ann2snn.sim_engine.weights@2":
+        raise ValueError(
+            f"unsupported weights bundle format {fmt!r}; expected "
+            "'ann2snn.sim_engine.weights@2' (the 6-input policy channel changed "
+            "the bundle format — retrain with `python -m sim_engine train`)"
+        )
 
     out: Dict[str, object] = {"training": bundle.get("training")}
     if "dense" in bundle:

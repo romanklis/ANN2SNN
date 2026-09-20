@@ -154,7 +154,7 @@ All responses are JSON; the API never leaks torch tensors.
 | `GET` | `/api/sessions/<id>/trajectory` | recorded trace |
 | `DELETE` | `/api/sessions/<id>` | drop the session |
 
-`POST /api/simulate` body: `{controller, seed=42, steps=250, radius=0.15,
+`POST /api/simulate` body: `{controller, seed=42, steps=500, radius=0.15,
 freq=0.5, spike_format="events"}`. The response is normalised for the UI:
 `trajectory` (T×4), `tilts` (T×2), `error_cm` (T), `target` (T×2),
 `reference{pos,vel,acc,dt,radius,freq}`, `metrics{mean/rms/max/final_error_cm,
@@ -198,11 +198,12 @@ every panel.
   ANN is drawn 1 px larger so a thin amber rim stays visible. Off-plate balls are
   clamped red at the plate edge; an isometric legend keys
   target / FLY-LIKE ANN / SNN TRANSFERRED.
-* **Controller pipeline (right, top)** — `FLY-LIKE ANN` → *WEIGHT TRANSFER* →
-  `SNN TRANSFERRED` → *CLOSE LOOP* → `BALL + PLATE`. On load (and on each loop /
-  record start) it runs a ~1.8 s scripted reveal and then settles on
-  `CLOSED LOOP · SPIKING`. The copy is deliberately plain ("SNN transferred from
-  the fly-like ANN").
+* **Controller pipeline (right, top)** — four compact rows describing the closed
+  loop: `PLANT (ball + plate) → CAMERA (y = [x, y] + v) → KALMAN (x̂) → POLICY
+  (π(e), e = x̂ − r, u = π(e, u_ff))`, with `FLY-LIKE ANN → SNN TRANSFERRED` as the
+  policy label and a footnote that the weight transfer is **offline** (not part of
+  the loop). On load (and on each loop / record start) a ~1.8 s scripted reveal
+  highlights the rows in order and settles on POLICY.
 * **Spike activity (right)** — the SNN's spikes on a Canvas 2D raster that
   advances with the shared frame cursor; titled
   `first 200 of <N> neurons` (`N` is the engine's neuron count).
@@ -211,7 +212,8 @@ every panel.
 * **Tracking (right)** — radial tracking error in cm vs time: `flylike_ann` solid,
   `snn_transferred` dashed.
 * **Single Play/Pause** — one round button drives the whole shared cursor
-  (looping). Fixed defaults: seed 42, 250 steps, radius 0.15 m, 0.5 Hz.
+  (looping). Fixed defaults: seed 42, 500 steps (10 s at 50 Hz), radius 0.15 m,
+  0.5 Hz.
 * **Header** — `● RUNNING`, live `t = … s`, `● SPIKING`, neuron/frame counts, seed,
   API/trained badges.
 * **Result bar (footer)** — `TRANSFER EXPERIMENT`: fly-like ANN error ·
@@ -255,6 +257,8 @@ python3 -m pytest tests server/tests tools/tests -q
 
 ## Validation notes
 
-The learned brains are untrained by default and diverge; after distillation the
-reference numbers (250 steps, seed 42) are approximately: pid 2.426 cm,
-snn_transferred 6.371, flylike_ann 6.427, dense_ann 7.828.
+The learned brains are distilled on first use (a clean bundle, plus a robust
+bundle per embodied preset). Reference numbers (500 steps = 10 s, clean
+environment, seed 42, 1000 neurons): pid 1.447 cm, dense_ann 1.631,
+flylike_ann 1.797, snn_transferred 2.029, and pid_no_ff 7.556 cm (the PD law
+without the feed-forward channel).

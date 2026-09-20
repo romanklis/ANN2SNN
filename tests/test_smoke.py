@@ -116,7 +116,7 @@ def test_snn_transfer_is_finite_and_spiking():
     ann = ConnectomeANNController(n_neurons=64, synapses_per_neuron=8, seed=5)
     snn = LosslessConnectomeSNN(ann, micro_steps=5)
     snn.reset()
-    tilt, spikes = snn.step(torch.tensor([0.05, -0.05, 0.0, 0.0]))
+    tilt, spikes = snn.step(torch.tensor([0.05, -0.05, 0.0, 0.0, 0.0, 0.0]))
     assert tilt.shape == (2,)
     assert spikes.shape == (64,)
     assert set(spikes.unique().tolist()) <= {0.0, 1.0}

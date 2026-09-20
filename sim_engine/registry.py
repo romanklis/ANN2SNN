@@ -30,7 +30,8 @@ from .controllers import (
     LosslessConnectomeSNN,
 )
 
-__all__ = ["ControllerRegistry", "CANONICAL_CONTROLLERS", "ALIASES", "normalize_name"]
+__all__ = ["ControllerRegistry", "CANONICAL_CONTROLLERS", "EXTRA_CONTROLLERS",
+           "ALIASES", "normalize_name"]
 
 #: Canonical names in display order.
 CANONICAL_CONTROLLERS: List[str] = [
@@ -40,6 +41,11 @@ CANONICAL_CONTROLLERS: List[str] = [
     "snn_transferred",
     "dense_ann",
 ]
+
+#: Diagnostic arms that are resolvable but not part of the headline catalogue.
+#: ``pid_no_ff`` is the same PD law without the acceleration feed-forward, i.e.
+#: the no-feed-forward performance limit the learned arms were previously stuck at.
+EXTRA_CONTROLLERS: List[str] = ["pid_no_ff"]
 
 #: Human labels for the frontend.
 LABELS: Dict[str, str] = {
@@ -128,9 +134,10 @@ class ControllerRegistry:
 
     def resolve(self, name: str) -> str:
         canonical = normalize_name(name)
-        if canonical not in CANONICAL_CONTROLLERS:
+        if canonical not in CANONICAL_CONTROLLERS and canonical not in EXTRA_CONTROLLERS:
             raise KeyError(
-                f"unknown controller {name!r}; available: {', '.join(CANONICAL_CONTROLLERS)}"
+                f"unknown controller {name!r}; available: "
+                f"{', '.join(CANONICAL_CONTROLLERS + EXTRA_CONTROLLERS)}"
             )
         return canonical
 
@@ -160,6 +167,9 @@ class ControllerRegistry:
 
         if canonical == "pid":
             return ClassicalPDController(device=self.device)
+
+        if canonical == "pid_no_ff":
+            return ClassicalPDController(use_feedforward=False, device=self.device)
 
         if canonical == "random_ann":
             # Deterministic but distinct from the distilled model: offset seed.

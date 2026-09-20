@@ -40,9 +40,11 @@ One `POST /api/benchmark` runs the experiment pair (`flylike_ann`,
   balls nearly coincide. They are painted in strict series order (ANN first, SNN
   always on top) so the visible colour never flips; the ANN is 1 px larger so a
   thin amber rim stays visible.
-* **Controller pipeline (right top)** — `FLY-LIKE ANN` → *WEIGHT TRANSFER* →
-  `SNN TRANSFERRED` → *CLOSE LOOP* → `BALL + PLATE`, with a scripted reveal on
-  load/loop/record.
+* **Controller pipeline (right top)** — four compact rows for the closed loop:
+  `PLANT (ball+plate) → CAMERA (y = [x,y]+v) → KALMAN (x̂) → POLICY (π(e), e = x̂ − r)`,
+  with the `FLY-LIKE ANN → SNN TRANSFERRED` name on the POLICY row and a footnote
+  that the weight transfer is **offline** (not part of the loop). A scripted reveal
+  runs on load/loop/record.
 * **Spike activity (right)** — first 200 of `<N>` SNN neurons, animated with the
   shared cursor.
 * **Control output (right)** — SNN plate tilt `θx`/`θy` (rad).
@@ -54,7 +56,7 @@ One `POST /api/benchmark` runs the experiment pair (`flylike_ann`,
   embodied presets use the robust policy (auto-distilled). A footer **robustness
   strip** shows ANN/SNN mean error across presets. See `docs/EMBODIMENT.md`.
 * **Single Play/Pause** — one button drives the shared cursor (looping). Fixed
-  defaults: seed 42, 250 steps, r 0.15, f 0.5 Hz.
+  defaults: seed 42, 500 steps (10 s), r 0.15, f 0.5 Hz.
 
 ## Build
 

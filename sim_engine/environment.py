@@ -68,6 +68,7 @@ class EmbodiedEnv:
         self.impulse_count = 0
         self._k = 0
         self.last_disturbance = torch.zeros(2, dtype=dtype, device=self.device)
+        self.last_kick = torch.zeros(2, dtype=dtype, device=self.device)
         self.last_impulse = False
         self.reset()
 
@@ -109,6 +110,7 @@ class EmbodiedEnv:
         self.impulse_count = 0
         self._k = 0
         self.last_disturbance = zero.clone()
+        self.last_kick = zero.clone()
         self.last_impulse = False
 
     # --------------------------------------------------------------- sensing
@@ -140,11 +142,18 @@ class EmbodiedEnv:
 
     # ------------------------------------------------------------- disturbance
     def _disturbance(self, k: int):
+        """Return ``(accel, kick, impulse)``.
+
+        ``accel`` is a continuous acceleration disturbance [m/s^2] (process noise);
+        ``kick`` is a one-off **velocity** impulse [m/s] (``impulse_std``), applied
+        directly to the ball's velocity.
+        """
         cfg = self.config
-        d = torch.zeros(2, dtype=self.dtype, device=self.device)
+        accel = torch.zeros(2, dtype=self.dtype, device=self.device)
+        kick = torch.zeros(2, dtype=self.dtype, device=self.device)
         impulse = False
         if self.process_noise:
-            d = d + torch.as_tensor(
+            accel = accel + torch.as_tensor(
                 self._rng.normal(0.0, self.process_noise, size=2),
                 dtype=self.dtype, device=self.device,
             )
@@ -154,21 +163,28 @@ class EmbodiedEnv:
             elif cfg.impulse_prob and self._rng.random() < cfg.impulse_prob:
                 impulse = True
             if impulse:
-                d = d + torch.as_tensor(
+                kick = kick + torch.as_tensor(
                     self._rng.normal(0.0, self.impulse_std, size=2),
                     dtype=self.dtype, device=self.device,
                 )
-        return d, impulse
+        return accel, kick, impulse
 
     # -------------------------------------------------------------------- step
     def step(self, state: torch.Tensor, command: torch.Tensor, k: Optional[int] = None) -> torch.Tensor:
         """Integrate one timestep with the body model and the current disturbance."""
         step_k = self._k if k is None else int(k)
-        d, impulse = self._disturbance(step_k)
-        self.last_disturbance = d
+        accel, kick, impulse = self._disturbance(step_k)
+        # `last_disturbance` reports the equivalent acceleration (kick/dt) so the
+        # disturbance RMS reflects both channels.
+        self.last_kick = kick
+        self.last_disturbance = accel + kick / self.dt
         self.last_impulse = impulse
         if impulse:
             self.impulse_count += 1
+        if float(kick.abs().sum()) > 0.0:
+            state = state.clone()
+            state[2] = state[2] + kick[0]
+            state[3] = state[3] + kick[1]
         nxt = step_physics(
             state,
             command,
@@ -176,7 +192,7 @@ class EmbodiedEnv:
             max_tilt=self.max_tilt,
             c_const=C_CONST * self.c_scale,
             damping=self.damping,
-            disturbance=d,
+            disturbance=accel,
         )
         self._k = step_k + 1
         return nxt

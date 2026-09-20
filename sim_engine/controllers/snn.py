@@ -1,9 +1,14 @@
-"""Lossless micro-stepping spiking transfer of the connectome ANN.
+"""Rate-coded micro-stepping spiking transfer of the connectome ANN.
 
 The ANN's continuous ReLU activations are replaced by an integrate-and-fire
 population that is integrated with ``micro_steps`` internal sub-steps per
 control frame, a technique that reproduces the ANN's *rate* behaviour with
-binary spikes and no accuracy loss over a closed-loop rollout.
+binary spikes.
+
+This is an approximation, not an identity: the recurrent drive flows through
+binary spikes where the ANN uses continuous activations, so "lossless" is an
+**empirical** claim about closed-loop tracking fidelity (verified over several
+seeds), not a mathematical guarantee.
 
 Dynamics per micro-step ``s``::
 
@@ -28,8 +33,10 @@ __all__ = ["LosslessConnectomeSNN"]
 
 
 class LosslessConnectomeSNN(BaseController):
-    """IF spiking network transferred losslessly from a connectome ANN.
+    """IF spiking network transferred from a connectome ANN.
 
+    The transfer is rate-coded and approximate (see the module docstring); its
+    closed-loop fidelity is an empirical result, reported over multiple seeds.
     Parameters
     ----------
     ann_model:
@@ -76,6 +83,7 @@ class LosslessConnectomeSNN(BaseController):
 
     # -- lifecycle ---------------------------------------------------------- #
     def reset(self) -> None:
+        super().reset()
         self._v = torch.zeros(self.n_neurons, dtype=self.dtype, device=self.device)
         self._s = torch.zeros(self.n_neurons, dtype=self.dtype, device=self.device)
         self._micro_spike_history = []
@@ -115,7 +123,7 @@ class LosslessConnectomeSNN(BaseController):
         return tilt, self._s.clone()
 
     def raw_act(self, state: torch.Tensor, ref) -> torch.Tensor:
-        err = error_vector(state, ref).to(self.device, dtype=self.dtype)
+        err = self.policy_input(state, ref).to(self.device, dtype=self.dtype)
         tilt, _ = self.step(err)
         return tilt
 

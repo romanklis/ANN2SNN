@@ -99,12 +99,12 @@ def test_simulate_pid_default(client):
     body = r.get_json()
     assert body["ok"] is True
     assert body["controller"] == "pid"
-    assert body["steps"] == 250
-    assert len(body["trajectory"]) == 250
-    assert len(body["tilts"]) == 250
-    assert len(body["error_cm"]) == 250
-    assert len(body["reference"]["pos"]) == 250
-    assert len(body["target"]) == 250
+    assert body["steps"] == 500
+    assert len(body["trajectory"]) == 500
+    assert len(body["tilts"]) == 500
+    assert len(body["error_cm"]) == 500
+    assert len(body["reference"]["pos"]) == 500
+    assert len(body["target"]) == 500
     assert body["metrics"]["mean_error_cm"] > 0
     assert "spikes" not in body
 

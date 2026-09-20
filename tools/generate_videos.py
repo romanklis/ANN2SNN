@@ -239,8 +239,8 @@ def main() -> int:
     )
     ap.add_argument("--outdir", default=DEFAULT_OUTDIR)
     ap.add_argument("--cache-dir", default=DEFAULT_CACHE)
-    ap.add_argument("--steps", type=int, default=250,
-                    help="control frames (250 = the canonical 5 s benchmark)")
+    ap.add_argument("--steps", type=int, default=500,
+                    help="control frames (500 = the canonical 10 s benchmark)")
     ap.add_argument("--radius", type=float, default=0.15)
     ap.add_argument("--freq", type=float, default=0.5)
     ap.add_argument("--seed", type=int, default=42)

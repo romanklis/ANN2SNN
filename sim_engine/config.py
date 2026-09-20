@@ -20,6 +20,7 @@ from .physics import (
 )
 
 __all__ = [
+    "DEFAULT_STEPS",
     "PlantConfig",
     "NetworkConfig",
     "EmbodimentConfig",
@@ -27,6 +28,9 @@ __all__ = [
     "BenchmarkConfig",
     "EngineConfig",
 ]
+
+#: Canonical closed-loop horizon: 500 control frames at ``DT = 0.02`` (50 Hz) = 10 s.
+DEFAULT_STEPS: int = 500
 
 
 def _default_init_state() -> Tuple[float, float, float, float]:
@@ -168,7 +172,7 @@ EMBODIMENT_PRESETS: Dict[str, dict] = {
 class BenchmarkConfig:
     """Closed-loop trajectory-evaluation parameters."""
 
-    steps: int = 250
+    steps: int = DEFAULT_STEPS
     radius: float = 0.15
     freq: float = 0.5
     record_spikes: bool = True

@@ -37,6 +37,7 @@ class ClassicalPDController(BaseController):
         zeta: float = 0.85,
         c_const: float = C_CONST,
         max_tilt: float = MAX_TILT,
+        use_feedforward: bool = True,
         device="cpu",
     ) -> None:
         super().__init__(device=device)
@@ -46,13 +47,18 @@ class ClassicalPDController(BaseController):
         self.max_tilt = max_tilt
         self.kp = (omega_n ** 2) / c_const
         self.kd = (2.0 * zeta * omega_n) / c_const
+        self.use_feedforward = bool(use_feedforward)
+        self.uses_feedforward = self.use_feedforward
 
     def raw_act(self, state: torch.Tensor, ref) -> torch.Tensor:
         err = error_vector(state, ref)
         # The feed-forward term cancels the reference acceleration so the PD
         # action only has to correct the *residual* tracking error.
-        theta_x = self.kp * err[0] + self.kd * err[2] - ref.acc[0] / self.c_const
-        theta_y = self.kp * err[1] + self.kd * err[3] - ref.acc[1] / self.c_const
+        theta_x = self.kp * err[0] + self.kd * err[2]
+        theta_y = self.kp * err[1] + self.kd * err[3]
+        if self.use_feedforward:
+            theta_x = theta_x - ref.acc[0] / self.c_const
+            theta_y = theta_y - ref.acc[1] / self.c_const
         return torch.stack([theta_x, theta_y])
 
     def describe(self) -> dict:

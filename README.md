@@ -22,9 +22,14 @@ never sees the true state:
 x_{k+1} = f(x_k, u_k) + w_k
 y_k     = h(x_k) + v_k            h(x) = [x, y]     (camera: position only)
 x̂_k     = E(y_{0:k}, u_{0:k-1})                    E = Kalman filter
-e_k     = r_k − x̂_k
-u_k     = π_θ(e_k)
+e_k     = x̂_k − r_k
+u_ff,k  = −â_ref,k / C            â_ref reconstructed from x̂ (known rolling gain C)
+u_k     = π_θ([e_k, u_ff,k])      6-D policy input
 ```
+
+The learned arms receive the same feed-forward channel the PID reference uses
+(`u_ff`, reconstructed from the Kalman estimate — never the true state), so the
+comparison is like-for-like.
 
 `π_ANN → π_SNN` is an **offline** weight transfer; both networks are inserted into
 this identical loop, so the ANN/SNN comparison holds the plant and reference fixed.
@@ -63,17 +68,29 @@ engine = Engine(cfg)                    # ~12 s on CPU for 100 epochs
 report = engine.run_benchmark(["pid", "flylike_ann", "snn_transferred", "random_ann"])
 ```
 
-Typical CPU numbers (250-frame orbit):
+Typical CPU numbers (10-second, 500-frame orbit, clean environment, 1000 neurons, seed 42):
 
 ```
-1. pid              mean  2.426 cm
-2. snn_transferred  mean  6.369 cm
-3. flylike_ann      mean  6.427 cm
-4. random_ann       mean 74.890 cm
+1. pid              mean  1.447 cm
+2. dense_ann        mean  1.631 cm
+3. flylike_ann      mean  1.797 cm
+4. snn_transferred  mean  2.029 cm
+5. pid_no_ff        mean  7.556 cm     # PD without the acceleration feed-forward
+6. random_ann       mean 634.607 cm    # diverges over the longer horizon
 ```
 
-The **SNN transfer is essentially lossless**: it tracks within a few
-hundredths of a centimetre of the connectome ANN it was transferred from.
+All controllers receive the same 6-D policy input `[e, u_ff]`, where `u_ff` is the
+feed-forward command reconstructed from the Kalman estimate. For reference,
+`pid_no_ff` is the same PD law with that channel removed — the ≈7.6 cm
+no-feed-forward limit the learned arms used to sit at, which is why the earlier
+ranking looked like a distillation shortfall. It was an input-information gap.
+
+The **SNN transfer** is a rate-coded approximation of the connectome ANN (binary
+spikes through the recurrence, 10 micro-steps/frame, mean output rate as the
+command). It is *empirically* faithful — over 5 seeds (500 frames, clean) the ANN
+tracks `1.675 ± 0.063 cm` and the SNN `1.931 ± 0.082 cm`, a ≈0.26 cm gap — and is
+not claimed to be an identity. Run `python -m sim_engine benchmark --seeds
+42,1,2,3,4` for mean ± spread; a single seed is not evidence.
 
 ## Command line
 
@@ -81,7 +98,7 @@ hundredths of a centimetre of the connectome ANN it was transferred from.
 python -m sim_engine list                       # catalogue of brains
 python -m sim_engine describe                   # full engine config as JSON
 python -m sim_engine benchmark --controllers pid,random_ann,flylike_ann,snn_transferred \
-        --steps 250 --out results.json
+        --steps 500 --out results.json
 python -m sim_engine train --epochs 100 --save weights.pt
 python -m sim_engine session --controller snn_transferred --frames 20 --verbose
 ```
@@ -127,7 +144,7 @@ no torch objects cross the boundary.
 ```python
 from sim_engine.api import EngineService
 
-svc = EngineService({"steps": 250, "train_on_init": True})
+svc = EngineService({"steps": 500, "train_on_init": True})
 
 svc.controllers()                       # catalogue for the UI
 svc.benchmark(["pid", "snn_transferred"])   # batch closed-loop report

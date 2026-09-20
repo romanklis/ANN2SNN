@@ -43,8 +43,13 @@ PLATE_HALF: float = 0.25
 # --------------------------------------------------------------------------- #
 # Network dimensions
 # --------------------------------------------------------------------------- #
-N_IN: int = 4
-"""Controller input width: ``[ex, ey, evx, evy]``."""
+N_IN: int = 6
+"""Controller input width: ``[ex, ey, evx, evy, uff_x, uff_y]``.
+
+The last two are the feed-forward command ``u_ff = −â_ref/C``, where ``â_ref`` is
+the reference acceleration reconstructed from the Kalman estimate (position-only
+camera); the controller never receives the true state.
+"""
 
 N_OUT: int = 2
 """Controller output width: ``[theta_x, theta_y]``."""

@@ -20,7 +20,7 @@ const ANN = "flylike_ann";
 const SNN = "snn_transferred";
 const ANN_COLOR = "#ffb454";
 const SNN_COLOR = "#7ee0c0";
-const BENCH = { steps: 250, seed: 42, radius: 0.15, freq: 0.5 };
+const BENCH = { steps: 500, seed: 42, radius: 0.15, freq: 0.5 };
 
 const el = {
   runPill: $("run-pill"),

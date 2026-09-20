@@ -20,10 +20,13 @@ from sim_engine.config import (
     TrainingConfig,
 )
 from sim_engine.controllers import ClassicalPDController
+from sim_engine.controllers.base import error_vector
 from sim_engine.engine import Engine
 from sim_engine.environment import EmbodiedEnv, embodiment_specs
 from sim_engine.physics import C_CONST, DT, step_physics
+from sim_engine.reference import orbit_reference
 from sim_engine.robustness import sweep
+from sim_engine.training import pd_target
 
 
 # --------------------------------------------------------------------------- #
@@ -116,33 +119,78 @@ def test_presets_and_specs():
 
 
 # --------------------------------------------------------------------------- #
+# sign convention, feed-forward channel, velocity-kick impulses
+# --------------------------------------------------------------------------- #
+def test_error_sign_convention():
+    """e = x − r (the code's convention): a ball right of the reference needs a
+    positive tilt, and pd_target reproduces that."""
+    ref = orbit_reference(steps=10, radius=0.15, freq=0.5)
+    rp = ref.at(3)
+    state = torch.tensor([float(rp.pos[0]) + 0.05, float(rp.pos[1]),
+                          float(rp.vel[0]), float(rp.vel[1])])
+    e = error_vector(state, rp)
+    assert float(e[0]) == pytest.approx(0.05)
+    assert float(ClassicalPDController().act(state, rp)[0]) > 0.0
+    label = pd_target(torch.tensor([[0.05, 0.0, 0.0, 0.0, 0.0, 0.0]]),
+                      ClassicalPDController())
+    assert float(label[0, 0]) > 0.0
+
+
+def test_impulse_is_a_velocity_kick():
+    env = EmbodiedEnv(
+        EmbodimentConfig(impulse_interval=5, impulse_std=0.2, process_noise=0.0),
+        init_state=(0.0, 0.0, 0.0, 0.0),
+    )
+    env.reset(seed=1)
+    state = torch.zeros(4)
+    u = torch.zeros(2)
+    for k in range(5):
+        state = env.step(state, u, k)
+    v_before = state[2:].clone()
+    state = env.step(state, u, 5)
+    assert env.impulse_count == 1
+    assert torch.allclose(state[2:] - v_before, env.last_kick)
+    assert float(env.last_kick.abs().sum()) > 0.0
+
+
+def test_pid_no_ff_is_the_no_feedforward_limit():
+    engine = Engine()
+    cfg = BenchmarkConfig(steps=250, embodiment=EmbodimentConfig.from_preset("clean"))
+    pid = engine.run("pid", config=cfg)
+    no_ff = engine.run("pid_no_ff", config=cfg)
+    assert pid.mean_error_cm < 3.5                       # PID with feed-forward
+    assert 6.0 < no_ff.mean_error_cm < 10.0              # ≈7.9 cm analytic no-FF limit
+    assert no_ff.mean_error_cm > 1.8 * pid.mean_error_cm
+
+
+# --------------------------------------------------------------------------- #
 # benchmark integration
 # --------------------------------------------------------------------------- #
 def test_clean_benchmark_uses_the_estimator():
     engine = Engine()
-    res = engine.run("pid", config=BenchmarkConfig(steps=250))
+    res = engine.run("pid", config=BenchmarkConfig(steps=500))
     # clean still tracks well, but the controller now runs on the Kalman estimate
     assert res.mean_error_cm < 3.0
     assert res.on_plate_pct is not None
-    assert res.estimates is not None and res.estimates.shape == (250, 4)
-    assert res.measurements is not None and res.measurements.shape == (250, 2)
+    assert res.estimates is not None and res.estimates.shape == (500, 4)
+    assert res.measurements is not None and res.measurements.shape == (500, 2)
     assert res.estimation_pos_rmse_cm is not None and res.estimation_pos_rmse_cm < 1.0
     assert res.estimator is not None and res.estimator["name"] == "kalman"
 
 
 def test_embodied_benchmark_reports_new_metrics():
     engine = Engine()
-    cfg = BenchmarkConfig(steps=250, embodiment=EmbodimentConfig.from_preset("perturbed"))
+    cfg = BenchmarkConfig(steps=500, embodiment=EmbodimentConfig.from_preset("perturbed"))
     res = engine.run("pid", config=cfg)
     assert 0.0 <= res.on_plate_pct <= 100.0
-    assert res.impulse_count == 4  # every 60 frames over 250 -> 60,120,180,240
+    assert res.impulse_count == 8  # every 60 frames over 500 -> 60..480
     assert res.disturbance_rms is not None and res.disturbance_rms > 0
     assert res.env is not None and res.env["preset"] == "perturbed"
     assert res.estimation_pos_rmse_cm is not None
     assert res.measurements is not None and res.measurements.shape[1] == 2
     # a delayed sensor clearly degrades PID's clean 2.426 cm
     delayed = engine.run("pid", config=BenchmarkConfig(
-        steps=250, embodiment=EmbodimentConfig.from_preset("delayed")))
+        steps=500, embodiment=EmbodimentConfig.from_preset("delayed")))
     assert delayed.mean_error_cm > res.mean_error_cm
 
 

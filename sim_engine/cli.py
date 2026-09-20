@@ -81,6 +81,42 @@ def cmd_describe(args) -> int:
 def cmd_benchmark(args) -> int:
     engine = _engine_from_args(args)
     names = args.controllers.split(",") if args.controllers else list(CANONICAL_CONTROLLERS)
+
+    if getattr(args, "seeds", None):
+        # Multi-seed evidence: mean ± std across initialisations / disturbances.
+        from .config import BenchmarkConfig
+        from .robustness import multi_seed
+
+        seeds = [int(s) for s in args.seeds.split(",") if s.strip()]
+        cfg = BenchmarkConfig(steps=args.steps, radius=args.radius, freq=args.freq)
+
+        def build_for_seed(seed: int):
+            cfg = {
+                "steps": args.steps, "radius": args.radius, "freq": args.freq,
+                "micro_steps": args.micro_steps, "n_neurons": args.neurons,
+                "seed": seed, "device": args.device,
+                "weights_path": args.weights,
+                "train_on_init": bool(getattr(args, "train", False)),
+            }
+            if getattr(args, "embodiment", None):
+                cfg["embodiment_preset"] = args.embodiment
+            eng = build_engine(cfg, train=bool(getattr(args, "train", False)))
+            return {n: eng.build_controller(n) for n in names}
+
+        result = multi_seed(build_for_seed, seeds=seeds, config=cfg)
+        if args.out:
+            with open(args.out, "w") as fh:
+                json.dump(result, fh, indent=2)
+            print(f"wrote {args.out}")
+        print("=" * 66)
+        print(f"MULTI-SEED BENCHMARK  seeds={result['seeds']}  steps={args.steps}")
+        print("=" * 66)
+        for name, s in sorted(result["summary"].items(), key=lambda kv: kv[1]["mean_error_cm"]):
+            print(f"{name:<20s} {s['mean_error_cm']:6.3f} ± {s['std_error_cm']:5.3f} cm "
+                  f"(n={s['n']}, min {s['min_error_cm']:.3f}, max {s['max_error_cm']:.3f})")
+        print("=" * 66)
+        return 0
+
     report = engine.run_benchmark(names, include_trace=not args.no_trace, as_dict=False)
 
     # JSON to stdout (or file)
@@ -239,6 +275,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--out", default=None, help="write full JSON report here")
     sp.add_argument("--no-trace", action="store_true", help="omit per-step traces from JSON")
     sp.add_argument("--quiet", action="store_true", help="suppress the summary table")
+    sp.add_argument("--seeds", default=None,
+                    help="comma-separated seeds for multi-seed mean±std (e.g. 42,1,2,3,4)")
     sp.set_defaults(func=cmd_benchmark)
 
     sp = sub.add_parser("train", help="behavioral distillation of the PD teacher")

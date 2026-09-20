@@ -57,36 +57,36 @@
         <!-- Controller pipeline ------------------------------------------ -->
         <section class="panel panel-controller">
           <h2>Controller pipeline</h2>
-          <div id="controller-pipeline" class="pipeline" data-phase="ann">
-            <div class="pipeline-node node-ann">
-              <span class="pn-kicker">SOURCE</span>
-              <span class="pn-title">FLY-LIKE ANN</span>
+          <div id="controller-pipeline" class="pipeline" data-phase="plant">
+            <div class="pipe-row node-plant">
+              <span class="pr-rule"></span>
+              <span class="pr-label">PLANT</span>
+              <span class="pr-value">BALL + PLATE</span>
             </div>
-            <div class="pipe-link link-transfer">
-              <span class="pipe-arrow"></span>
-              <span class="pipe-label">WEIGHT TRANSFER</span>
+            <div class="pipe-row node-camera">
+              <span class="pr-rule"></span>
+              <span class="pr-label">CAMERA</span>
+              <span class="pr-value">y = [x, y] + v
+                <span class="pr-sub">position-only · noisy · delayed</span>
+              </span>
             </div>
-            <div class="pipeline-node node-snn">
-              <span class="pn-kicker">TARGET</span>
-              <span class="pn-title">SNN TRANSFERRED <i class="spiking-dot"></i></span>
+            <div class="pipe-row node-kalman">
+              <span class="pr-rule"></span>
+              <span class="pr-label">KALMAN</span>
+              <span class="pr-value">x̂ = [x, y, vx, vy]
+                <span class="pr-sub">delay-aware state estimate</span>
+              </span>
             </div>
-            <div class="pipe-link link-loop">
-              <span class="pipe-arrow"></span>
-              <span class="pipe-label">CLOSE LOOP</span>
+            <div class="pipe-row node-policy">
+              <span class="pr-rule"></span>
+              <span class="pr-label">POLICY</span>
+              <span class="pr-value">π(e) · FLY-LIKE ANN → SNN TRANSFERRED
+                <span class="pr-sub">e = x̂ − r · u = π(e, u_ff)</span>
+              </span>
             </div>
-            <div class="pipeline-node node-plant">
-              <span class="pn-kicker">PLANT</span>
-              <span class="pn-title">BALL + PLATE</span>
+            <div class="pn-note">
+              offline: FLY-LIKE ANN → SNN TRANSFERRED (weight transfer, not in the loop)
             </div>
-            <div class="pipeline-node node-sense">
-              <span class="pn-kicker">OBSERVATION</span>
-              <span class="pn-title">CAMERA · y = [x, y] + v</span>
-            </div>
-            <div class="pipeline-node node-sense">
-              <span class="pn-kicker">ESTIMATE</span>
-              <span class="pn-title">KALMAN · x̂ = [x, y, vx, vy]</span>
-            </div>
-            <div class="pn-note">controller input: e = r − x̂</div>
           </div>
         </section>
 

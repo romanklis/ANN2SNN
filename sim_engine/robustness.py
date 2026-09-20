@@ -11,10 +11,12 @@ from __future__ import annotations
 import dataclasses
 from typing import Callable, Dict, List, Optional, Sequence
 
+import numpy as np
+
 from .benchmark import evaluate
 from .config import EMBODIMENT_PRESETS, BenchmarkConfig, EmbodimentConfig
 
-__all__ = ["sweep", "build_env_config", "DEFAULT_AXIS_POINTS"]
+__all__ = ["sweep", "build_env_config", "DEFAULT_AXIS_POINTS", "multi_seed"]
 
 #: Default sweep grids (bounded so a sweep stays fast and cache-friendly).
 DEFAULT_AXIS_POINTS: Dict[str, list] = {
@@ -106,3 +108,37 @@ def sweep(
         "controllers": list(controllers),
         "cells": cells,
     }
+
+
+def multi_seed(
+    build_controllers: Callable[[int], Dict[str, object]],
+    *,
+    seeds: Sequence[int] = (42, 1, 2, 3, 4),
+    config: Optional[BenchmarkConfig] = None,
+) -> dict:
+    """Evaluate every controller across seeds and return mean ± std.
+
+    ``build_controllers(seed)`` must return a fresh controller dict for that seed
+    (different initialisations / disturbance realisations).  This is the evidence
+    behind claims like "the ANN→SNN transfer is essentially lossless" — a point
+    estimate from one seed is not enough.
+    """
+    base = config or BenchmarkConfig()
+    values: Dict[str, List[float]] = {}
+    for seed in seeds:
+        report = evaluate(build_controllers(int(seed)), config=base)
+        for name, res in report.results.items():
+            values.setdefault(name, []).append(float(res.mean_error_cm))
+
+    summary = {
+        name: {
+            "mean_error_cm": float(np.mean(v)),
+            "std_error_cm": float(np.std(v)),
+            "min_error_cm": float(np.min(v)),
+            "max_error_cm": float(np.max(v)),
+            "n": len(v),
+            "values": v,
+        }
+        for name, v in values.items()
+    }
+    return {"seeds": [int(s) for s in seeds], "summary": summary}

@@ -19,9 +19,9 @@ from typing import Any, Dict
 
 import torch
 
-from ..physics import N_IN, N_OUT, clamp_action
+from ..physics import C_CONST, DT, N_IN, N_OUT, clamp_action
 
-__all__ = ["BaseController", "ControllerError", "error_vector"]
+__all__ = ["BaseController", "ControllerError", "error_vector", "ReferenceAccelEstimator"]
 
 
 class ControllerError(RuntimeError):
@@ -32,7 +32,9 @@ def error_vector(state: torch.Tensor, ref) -> torch.Tensor:
     """Tracking error ``[ex, ey, evx, evy] = state - reference``.
 
     ``ref`` is a :class:`sim_engine.reference.RefPoint` (or any object exposing
-    ``pos``/``vel`` attributes).
+    ``pos``/``vel`` attributes).  This is the sign the plant needs: to push a ball
+    that sits at ``x > r`` back, the plate must tilt positively, i.e. the command
+    is a positive function of ``x - r``.
     """
     return torch.stack(
         [
@@ -42,6 +44,43 @@ def error_vector(state: torch.Tensor, ref) -> torch.Tensor:
             state[3] - ref.vel[1],
         ]
     )
+
+
+class ReferenceAccelEstimator:
+    """Reference acceleration reconstructed from the Kalman estimate.
+
+    The controller receives the estimated state ``x̂`` and the reference point, so
+    the reference itself is recoverable as ``r̂ = x̂ − e`` with
+    ``e = error_vector(x̂, r)``.  A three-point second difference of ``r̂`` gives the
+    reference acceleration ``â_ref`` (equal to ``ref.acc`` for a smooth reference),
+    and the feed-forward command follows as ``u_ff = −â_ref / C`` with the known
+    rolling gain ``C`` (ball mass).  No ground-truth state or oracle acceleration
+    is used anywhere.
+    """
+
+    def __init__(self, dt: float = DT, c_const: float = C_CONST) -> None:
+        self.dt = float(dt)
+        self.c_const = float(c_const)
+        self._hist: list = []
+
+    def reset(self) -> None:
+        self._hist = []
+
+    def update(self, state: torch.Tensor, ref) -> torch.Tensor:
+        """Feed-forward command ``u_ff`` (2,) for the current ``(x̂, ref)``."""
+        err = error_vector(state, ref)
+        r_hat = state - err                     # = ref, reconstructed from x̂
+        self._hist.append(r_hat)
+        if len(self._hist) > 3:
+            self._hist.pop(0)
+        if len(self._hist) == 3:
+            # second difference of the reference *position* (2-D)
+            a_hat = (
+                self._hist[2][:2] - 2.0 * self._hist[1][:2] + self._hist[0][:2]
+            ) / (self.dt ** 2)
+        else:
+            a_hat = torch.zeros(2, dtype=r_hat.dtype, device=r_hat.device)
+        return -a_hat / self.c_const
 
 
 class BaseController:
@@ -74,10 +113,24 @@ class BaseController:
             from ..physics import DT
 
             self.dt = DT
+        self._ff = ReferenceAccelEstimator(self.dt)
 
     # -- lifecycle ---------------------------------------------------------- #
     def reset(self) -> None:
         """Reset any internal (recurrent) state. No-op for feed-forward nets."""
+        self._ff.reset()
+
+    # -- policy input ------------------------------------------------------- #
+    def policy_input(self, state: torch.Tensor, ref) -> torch.Tensor:
+        """Policy input ``[ex, ey, evx, evy, uff_x, uff_y]``.
+
+        ``state`` is the Kalman estimate ``x̂`` (never the true state); the
+        feed-forward term is reconstructed from it (see
+        :class:`ReferenceAccelEstimator`).
+        """
+        err = error_vector(state, ref)
+        u_ff = self._ff.update(state, ref)
+        return torch.cat([err, u_ff])
 
     # -- control ------------------------------------------------------------ #
     def raw_act(self, state: torch.Tensor, ref) -> torch.Tensor:

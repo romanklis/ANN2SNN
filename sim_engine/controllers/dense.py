@@ -67,31 +67,30 @@ class DenseNNController(nn.Module, BaseController):
 
     # nn.Module machinery --------------------------------------------------- #
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Saturated actuator command for a batch ``x`` of error vectors."""
+        """Saturated actuator command for a batch ``x`` of policy inputs."""
         return clamp_action(self.net(x), self.max_tilt)
 
     # BaseController machinery --------------------------------------------- #
-    def raw_act(self, state: torch.Tensor, ref) -> torch.Tensor:
-        from .base import error_vector
+    def reset(self) -> None:
+        super().reset()
 
-        err = error_vector(state, ref).to(self.device, dtype=self._dtype())
-        return self.net(err)
+    def raw_act(self, state: torch.Tensor, ref) -> torch.Tensor:
+        return self.net(self._input(state, ref))
 
     def act(self, state: torch.Tensor, ref) -> torch.Tensor:
-        err = self._err(state, ref)
         with torch.no_grad():
-            return self.forward(err)
+            return self.forward(self._input(state, ref))
 
     # helpers --------------------------------------------------------------- #
     def _dtype(self):
         return next(self.parameters()).dtype
 
-    def _err(self, state: torch.Tensor, ref) -> torch.Tensor:
-        from .base import error_vector
-
-        return error_vector(state, ref).to(self.device, dtype=self._dtype())
+    def _input(self, state: torch.Tensor, ref) -> torch.Tensor:
+        """Policy input ``[e, u_ff]`` from the (Kalman) estimate and reference."""
+        return self.policy_input(state, ref).to(self.device, dtype=self._dtype())
 
     def describe(self) -> dict:
         d = BaseController.describe(self)
-        d.update({"n_neurons": self.n_neurons, "architecture": "4-1000-2 relu"})
+        d.update({"n_neurons": self.n_neurons,
+                  "architecture": f"{self.n_in}-{self.n_neurons}-{self.n_out} relu"})
         return d

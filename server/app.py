@@ -66,6 +66,7 @@ import numpy as np  # noqa: E402
 from sim_engine.api import EngineService, list_controllers  # noqa: E402
 from sim_engine.benchmark import evaluate, run_closed_loop  # noqa: E402
 from sim_engine.config import (  # noqa: E402
+    DEFAULT_STEPS,
     BenchmarkConfig,
     EmbodimentConfig,
     NetworkConfig,
@@ -82,6 +83,20 @@ from sim_engine.robustness import DEFAULT_AXIS_POINTS, MAX_POINTS  # noqa: E402
 from sim_engine.robustness import sweep as robustness_sweep  # noqa: E402
 from sim_engine.serialization import to_jsonable  # noqa: E402
 
+from server.validation import (  # noqa: E402
+    BadRequest,
+    _as_bool,
+    _as_float,
+    _as_int,
+    _as_spike_format,
+    _body,
+    _env_from_body,
+    _profile_from_body,
+    _spike_payload,
+)
+
+from server.runtime import DEFAULT_MICRO_STEPS, RUNTIME, WEIGHTS_PATH  # noqa: E402
+
 try:  # thread-cap the shared torch runtime once
     torch.set_num_threads(max(1, int(_THREADS)))
 except Exception:  # pragma: no cover - defensive
@@ -95,7 +110,6 @@ APP_VERSION = "1.0.0"
 
 ENGINE_VERSION: str = getattr(__import__("sim_engine"), "__version__", "0.1.0")
 TORCH_VERSION: str = getattr(torch, "__version__", "unknown")
-DEFAULT_MICRO_STEPS: int = NetworkConfig().micro_steps
 
 #: Hard bounds so one request cannot trigger an unbounded rollout / training run.
 MAX_STEPS: int = 2000
@@ -185,371 +199,19 @@ def _resolve_web_root() -> str:
 WEB_ROOT: str = _resolve_web_root()
 WEB_INDEX: str = os.path.join(WEB_ROOT, "index.html")
 
-#: Where distilled weights are cached between runs.
-WEIGHTS_PATH: str = os.environ.get(
-    "ANN2SNN_WEIGHTS", os.path.join(_REPO_ROOT, "weights.pt")
-).strip()
 
 
 # --------------------------------------------------------------------------- #
-# Request validation helpers
+# Request validation lives in server/validation.py
 # --------------------------------------------------------------------------- #
-class BadRequest(ValueError):
-    """Raised for a malformed body/query; turned into an HTTP 400."""
-
-
-def _as_int(value: Any, field: str, default: int, lo: int, hi: int) -> int:
-    if value is None:
-        value = default
-    if isinstance(value, bool):
-        raise BadRequest(f"'{field}' must be an integer")
-    try:
-        ivalue = int(value)
-    except (TypeError, ValueError):
-        raise BadRequest(f"'{field}' must be an integer, got {value!r}")
-    if ivalue < lo or ivalue > hi:
-        raise BadRequest(f"'{field}' must be within [{lo}, {hi}], got {ivalue}")
-    return ivalue
-
-
-def _as_float(value: Any, field: str, default: float, lo: float, hi: float) -> float:
-    if value is None:
-        value = default
-    if isinstance(value, bool):
-        raise BadRequest(f"'{field}' must be a number")
-    try:
-        fvalue = float(value)
-    except (TypeError, ValueError):
-        raise BadRequest(f"'{field}' must be a number, got {value!r}")
-    if not (lo <= fvalue <= hi):
-        raise BadRequest(f"'{field}' must be within [{lo}, {hi}], got {fvalue}")
-    return fvalue
-
-
-def _as_bool(value: Any, field: str, default: bool) -> bool:
-    if value is None:
-        return default
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
-        return bool(value)
-    if isinstance(value, str):
-        low = value.strip().lower()
-        if low in {"1", "true", "yes", "on"}:
-            return True
-        if low in {"0", "false", "no", "off"}:
-            return False
-    raise BadRequest(f"'{field}' must be a boolean, got {value!r}")
-
-
-def _body() -> Dict[str, Any]:
-    """Parse the JSON body, accepting an empty body as ``{}``."""
-    data = request.get_json(force=True, silent=True)
-    if data is None:
-        if not request.get_data(cache=True):
-            return {}
-        raise BadRequest("request body must be valid JSON")
-    if not isinstance(data, dict):
-        raise BadRequest("request body must be a JSON object")
-    return data
-
-
-def _spike_payload(spikes: Any, fmt: str) -> Optional[Dict[str, Any]]:
-    """Convert a raw ``(T, N)`` spike matrix into the requested wire format."""
-    if spikes is None or fmt == "none":
-        return None
-    T = len(spikes)
-    N = len(spikes[0]) if T else 0
-    if fmt == "full":
-        return {"format": "full", "shape": [T, N], "data": spikes}
-    if fmt == "events":
-        events = [
-            [t, n]
-            for t, row in enumerate(spikes)
-            for n, v in enumerate(row)
-            if v
-        ]
-        return {"format": "events", "shape": [T, N], "data": events}
-    if fmt == "counts":
-        counts = [0] * N
-        for row in spikes:
-            for n, v in enumerate(row):
-                if v:
-                    counts[n] += 1
-        return {"format": "counts", "shape": [T, N], "data": counts}
-    raise BadRequest("'spike_format' must be one of: full, events, counts, none")
-
-
-def _as_spike_format(body: Dict[str, Any]) -> str:
-    fmt = str(body.get("spike_format", "events")).strip().lower()
-    if fmt not in {"full", "events", "counts", "none"}:
-        raise BadRequest("'spike_format' must be one of: full, events, counts, none")
-    return fmt
 
 
 # --------------------------------------------------------------------------- #
-# Embodiment / profile parsing
+# Embodiment / profile parsing lives in server/validation.py
 # --------------------------------------------------------------------------- #
-def _validate_embodiment(cfg: EmbodimentConfig) -> None:
-    """Bound environmental difficulty so a request cannot be pathological."""
-    checks = [
-        ("sensor_noise_pos", cfg.sensor_noise_pos, 0.0, 0.05),
-        ("sensor_delay", cfg.sensor_delay, 0, 20),
-        ("actuator_delay", cfg.actuator_delay, 0, 20),
-        ("actuator_gain", cfg.actuator_gain, 0.1, 3.0),
-        ("damping", cfg.damping, 0.0, 5.0),
-        ("c_scale", cfg.c_scale, 0.3, 2.0),
-        ("process_noise", cfg.process_noise, 0.0, 5.0),
-        ("impulse_std", cfg.impulse_std, 0.0, 1.0),
-        ("impulse_prob", cfg.impulse_prob, 0.0, 1.0),
-        ("impulse_interval", cfg.impulse_interval, 0, 1000),
-    ]
-    for name, value, lo, hi in checks:
-        if value < lo or value > hi:
-            raise BadRequest(f"'embodiment.{name}' must be within [{lo}, {hi}], got {value}")
 
 
-def _env_from_body(body: Dict[str, Any]) -> Optional[EmbodimentConfig]:
-    """Build an :class:`EmbodimentConfig` from the request (or ``None``)."""
-    raw = body.get("embodiment")
-    if raw is None or raw is False:
-        return None
-    if raw is True:
-        return EmbodimentConfig.from_preset("embodied")
-    if isinstance(raw, str):
-        try:
-            return EmbodimentConfig.from_preset(raw)
-        except ValueError as exc:
-            raise BadRequest(str(exc))
-    if isinstance(raw, dict):
-        preset = raw.get("preset")
-        base = EmbodimentConfig.from_preset(preset) if preset else EmbodimentConfig()
-        data = dataclasses.asdict(base)
-        for key, value in raw.items():
-            if key in data and value is not None:
-                data[key] = value
-        try:
-            cfg = EmbodimentConfig(**data)
-        except TypeError as exc:
-            raise BadRequest(f"invalid embodiment object: {exc}")
-        _validate_embodiment(cfg)
-        return cfg
-    raise BadRequest("'embodiment' must be a preset name, a config object, or true")
-
-
-def _profile_from_body(body: Dict[str, Any]) -> str:
-    profile = str(body.get("profile", "clean")).strip().lower()
-    if profile not in {"clean", "robust"}:
-        raise BadRequest("'profile' must be 'clean' or 'robust'")
-    return profile
-
-
-# --------------------------------------------------------------------------- #
-# Runtime: one EngineService per (seed), plus distillation + weights caching
-# --------------------------------------------------------------------------- #
-class Runtime:
-    """Owns the engine instances, the weights cache and the training job."""
-
-    def __init__(self) -> None:
-        self._lock = threading.RLock()
-        self._train_lock = threading.Lock()
-        self.default_seed = int(os.environ.get("ANN2SNN_SEED", "42"))
-        self.n_neurons = int(os.environ.get("ANN2SNN_N_NEURONS", str(NetworkConfig().n_neurons)))
-        self.micro_steps = DEFAULT_MICRO_STEPS
-        self.weights_path: str = WEIGHTS_PATH
-        self.robust_epochs = int(os.environ.get("ANN2SNN_ROBUST_EPOCHS", "60"))
-        # Distil on first use when no cached bundle exists, so the learned brains
-        # actually balance out of the box. Set ANN2SNN_AUTO_TRAIN=0 to disable.
-        self.auto_train = str(os.environ.get("ANN2SNN_AUTO_TRAIN", "1")).strip().lower() \
-            not in {"0", "false", "no", "off"}
-        self._engines: Dict[str, EngineService] = {}
-        self._weight_overrides: Dict[str, str] = {}
-        self.job: Optional[dict] = None
-
-    # -- engine construction ------------------------------------------------ #
-    def _weights_path(self, seed: int, profile: str = "clean") -> str:
-        """Per-(profile, seed) weights bundle path."""
-        override = self._weight_overrides.get(profile)
-        base = override or self.weights_path
-        if not base:
-            return ""
-        if profile != "clean" and override is None:
-            root, ext = os.path.splitext(base)
-            base = f"{root}_{profile}{ext}"
-        if seed == self.default_seed:
-            return base
-        root, ext = os.path.splitext(base)
-        return f"{root}_seed{seed}{ext}"
-
-    @staticmethod
-    def _embodiment_key(embodiment) -> str:
-        if embodiment is None or embodiment.is_clean:
-            return "clean"
-        return json.dumps(embodiment.to_dict(), sort_keys=True)
-
-    def _config(self, seed: int, profile: str = "clean", embodiment=None) -> dict:
-        cfg: Dict[str, Any] = {
-            "seed": seed,
-            "device": "cpu",
-            "n_neurons": self.n_neurons,
-            "micro_steps": self.micro_steps,
-            "train_on_init": False,
-        }
-        if profile and profile != "clean":
-            cfg["training"] = {
-                "profile": profile,
-                "epochs": self.robust_epochs,
-                "episodes": 3,
-                "episode_steps": 200,
-                "noise_augment": 0.002,
-            }
-        weights = self._weights_path(seed, profile)
-        if weights and os.path.isfile(weights):
-            cfg["weights_path"] = weights
-        elif self.auto_train:
-            cfg["train_on_init"] = True
-        if embodiment is not None and not embodiment.is_clean:
-            cfg["embodiment"] = embodiment.to_dict()
-        return cfg
-
-    def _build(self, seed: int, profile: str = "clean", embodiment=None) -> EngineService:
-        weights = self._weights_path(seed, profile)
-        svc = EngineService(self._config(seed, profile, embodiment), train=None)
-        # Persist what we just distilled so later workers/restarts skip training.
-        try:
-            if (weights and not os.path.isfile(weights)
-                    and svc.engine.registry.trained):
-                os.makedirs(os.path.dirname(weights) or ".", exist_ok=True)
-                svc.engine.save_weights(weights)
-        except Exception as exc:  # noqa: BLE001 - caching is best-effort
-            app.logger.warning("could not cache distilled weights: %s", exc)
-        return svc
-
-    def service(self, seed: Optional[int] = None, profile: str = "clean", embodiment=None) -> EngineService:
-        """Return (and cache) the engine for *(seed, profile, embodiment)*."""
-        seed = self.default_seed if seed is None else int(seed)
-        profile = profile or "clean"
-        key = f"{seed}|{profile}|{self._embodiment_key(embodiment)}"
-        with self._lock:
-            svc = self._engines.get(key)
-            if svc is None:
-                svc = self._build(seed, profile, embodiment)
-                self._engines[key] = svc
-            return svc
-
-    def default_service(self) -> EngineService:
-        return self.service(self.default_seed)
-
-    @property
-    def trained(self) -> bool:
-        try:
-            return bool(self.default_service().engine.registry.trained)
-        except Exception:  # pragma: no cover - defensive
-            return False
-
-    def set_weights(self, path: Optional[str], profile: str = "clean") -> None:
-        with self._lock:
-            if path:
-                self._weight_overrides[profile] = path
-            else:
-                self._weight_overrides.pop(profile, None)
-            self._engines.clear()
-
-    # -- reference helpers -------------------------------------------------- #
-    def reference(self, engine, steps, radius, freq):
-        return engine.reference(steps=steps, radius=radius, freq=freq)
-
-    # -- training ----------------------------------------------------------- #
-    def start_training(
-        self, *, epochs: int, n_neurons: Optional[int], seed: int,
-        profile: str = "clean", embodiment=None,
-    ) -> dict:
-        if not self._train_lock.acquire(blocking=False):
-            raise BadRequest("a distillation job is already running")
-        job_id = uuid.uuid4().hex
-        self.job = {
-            "id": job_id,
-            "state": "queued",
-            "epoch": 0,
-            "epochs": int(epochs),
-            "profile": profile,
-            "stage": "queued",
-            "loss": None,
-            "error": None,
-            "started": time.time(),
-            "finished": None,
-        }
-        thread = threading.Thread(
-            target=self._train_worker,
-            args=(job_id, int(epochs), n_neurons, int(seed), profile,
-                  None if embodiment is None else embodiment.to_dict()),
-            daemon=True,
-        )
-        thread.start()
-        return {"job_id": job_id, "state": "queued", "epochs": int(epochs), "profile": profile}
-
-    def _train_worker(self, job_id: str, epochs: int, n_neurons: Optional[int],
-                      seed: int, profile: str, embodiment_dict: Optional[dict]) -> None:
-        from sim_engine import training as training_mod
-        from sim_engine.config import EmbodimentConfig
-
-        job = self.job
-        try:
-            network = NetworkConfig(n_neurons=int(n_neurons) if n_neurons else self.n_neurons)
-            embodiment = EmbodimentConfig(**embodiment_dict) if embodiment_dict else None
-            training = TrainingConfig(
-                epochs=epochs, seed=seed, device="cpu",
-                profile=profile, embodiment=embodiment,
-            )
-
-            def log_fn(which: str, epoch: int, loss: float) -> None:
-                if self.job is not None and self.job["id"] == job_id:
-                    self.job["stage"] = which
-                    self.job["epoch"] = int(epoch)
-                    self.job["loss"] = float(loss)
-
-            if job is not None and job["id"] == job_id:
-                job["state"] = "running"
-                job["stage"] = "data" if profile == "robust" else "dense"
-            distilled = training_mod.distill_profile(profile, network, training, log_fn=log_fn)
-
-            path = self._weights_path(seed, profile) or WEIGHTS_PATH
-            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-            training_meta = {
-                "history": distilled["history"],
-                "final_loss": distilled["final_loss"],
-                "config": distilled["config"],
-            }
-            training_mod.save_weights(
-                path,
-                dense=distilled["dense"],
-                connectome=distilled["connectome"],
-                training=training_meta,
-            )
-            self.set_weights(path, profile=profile)
-
-            if self.job is not None and self.job["id"] == job_id:
-                self.job["state"] = "done"
-                self.job["stage"] = "done"
-                self.job["loss"] = distilled["final_loss"]
-                self.job["weights_path"] = path
-        except Exception as exc:  # noqa: BLE001 - surfaced to the UI
-            if self.job is not None and self.job["id"] == job_id:
-                self.job["state"] = "error"
-                self.job["error"] = f"{type(exc).__name__}: {exc}"
-        finally:
-            if self.job is not None and self.job["id"] == job_id:
-                self.job["finished"] = time.time()
-            self._train_lock.release()
-
-    def job_status(self, job_id: str) -> Optional[dict]:
-        job = self.job
-        if job is None or job["id"] != job_id:
-            return None
-        return dict(job)
-
-
-RUNTIME = Runtime()
+# Engine runtime (services, weights cache, distillation jobs) lives in server/runtime.py
 
 
 # --------------------------------------------------------------------------- #
@@ -807,7 +469,7 @@ def create_app(config: Optional[Dict[str, Any]] = None) -> Flask:
             plate_half=PLATE_HALF_M,
             radius=0.15,
             freq=0.5,
-            default_steps=250,
+            default_steps=DEFAULT_STEPS,
             max_steps=MAX_STEPS,
             export_max_steps=EXPORT_MAX_STEPS,
             init_state=[-0.05, 0.05, 0.0, 0.0],
@@ -844,7 +506,7 @@ def create_app(config: Optional[Dict[str, Any]] = None) -> Flask:
     def simulate():
         try:
             body = _body()
-            steps = _as_int(body.get("steps"), "steps", 250, 1, MAX_STEPS)
+            steps = _as_int(body.get("steps"), "steps", DEFAULT_STEPS, 1, MAX_STEPS)
             seed = _as_int(body.get("seed"), "seed", RUNTIME.default_seed, SEED_MIN, SEED_MAX)
             radius = _as_float(body.get("radius"), "radius", 0.15, 0.0, 1.0)
             freq = _as_float(body.get("freq"), "freq", 0.5, 0.0, 10.0)
@@ -894,7 +556,7 @@ def create_app(config: Optional[Dict[str, Any]] = None) -> Flask:
             requested = body.get("controllers", list(CANONICAL_CONTROLLERS))
             if not isinstance(requested, (list, tuple)) or not requested:
                 raise BadRequest("'controllers' must be a non-empty list")
-            steps = _as_int(body.get("steps"), "steps", 250, 1, MAX_STEPS)
+            steps = _as_int(body.get("steps"), "steps", DEFAULT_STEPS, 1, MAX_STEPS)
             seed = _as_int(body.get("seed"), "seed", RUNTIME.default_seed, SEED_MIN, SEED_MAX)
             radius = _as_float(body.get("radius"), "radius", 0.15, 0.0, 1.0)
             freq = _as_float(body.get("freq"), "freq", 0.5, 0.0, 10.0)
@@ -931,7 +593,7 @@ def create_app(config: Optional[Dict[str, Any]] = None) -> Flask:
                 raise BadRequest("'controllers' must be a non-empty list")
             if len(requested) > 5:
                 raise BadRequest("a sweep supports at most 5 controllers")
-            steps = _as_int(body.get("steps"), "steps", 250, 1, MAX_STEPS)
+            steps = _as_int(body.get("steps"), "steps", DEFAULT_STEPS, 1, MAX_STEPS)
             seed = _as_int(body.get("seed"), "seed", RUNTIME.default_seed, SEED_MIN, SEED_MAX)
             radius = _as_float(body.get("radius"), "radius", 0.15, 0.0, 1.0)
             freq = _as_float(body.get("freq"), "freq", 0.5, 0.0, 10.0)
@@ -989,7 +651,7 @@ def create_app(config: Optional[Dict[str, Any]] = None) -> Flask:
     def export_mp4():
         try:
             body = _body()
-            steps = _as_int(body.get("steps"), "steps", 250, 1, EXPORT_MAX_STEPS)
+            steps = _as_int(body.get("steps"), "steps", DEFAULT_STEPS, 1, EXPORT_MAX_STEPS)
             seed = _as_int(body.get("seed"), "seed", RUNTIME.default_seed, SEED_MIN, SEED_MAX)
             radius = _as_float(body.get("radius"), "radius", 0.15, 0.0, 1.0)
             freq = _as_float(body.get("freq"), "freq", 0.5, 0.0, 10.0)
@@ -1053,7 +715,7 @@ def create_app(config: Optional[Dict[str, Any]] = None) -> Flask:
             controller = body.get("controller", "pid")
             opts = {}
             if body.get("steps") is not None:
-                opts["steps"] = _as_int(body["steps"], "steps", 250, 1, MAX_STEPS)
+                opts["steps"] = _as_int(body["steps"], "steps", DEFAULT_STEPS, 1, MAX_STEPS)
             if body.get("radius") is not None:
                 opts["radius"] = _as_float(body["radius"], "radius", 0.15, 0.0, 1.0)
             if body.get("freq") is not None:

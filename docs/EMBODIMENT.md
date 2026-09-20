@@ -22,8 +22,9 @@ timing/magnitudes), so comparisons are fair.
 | actuation | `actuator_gain` / `actuator_bias` | scale / offset of the plate command |
 | body | `damping` | velocity damping `b` [1/s] (`a -= b·v`) |
 | body | `c_scale` | effective rolling gain `C = C_CONST · c_scale` (mass/inertia) |
-| perturbation | `process_noise` | continuous acceleration jitter σ [m/s²] |
-| perturbation | `impulse_interval` / `impulse_prob` / `impulse_std` | scheduled / random kicks [m/s] |
+| perturbation | `process_noise` | continuous **acceleration** jitter σ [m/s²] |
+| perturbation | `impulse_interval` / `impulse_prob` | when a one-off kick is applied |
+| perturbation | `impulse_std` | **velocity** kick σ [m/s] (applied directly to the ball's velocity) |
 | randomisation | `randomize` + ranges | resample `c_scale`/`damping` each `reset()` |
 
 The closed loop becomes the canonical estimation/control separation — the
@@ -33,33 +34,41 @@ controller **never sees the true state**:
 x_{k+1} = f(x_k, u_k) + w_k
 y_k     = h(x_k) + v_k            h(x) = [x, y]      (camera: position only)
 x̂_k     = E(y_{0:k}, u_{0:k-1})                     E = Kalman filter
-e_k     = r_k − x̂_k
-u_k     = π_θ(e_k)
+e_k     = x̂_k − r_k
+u_ff,k  = −â_ref,k / C            â_ref reconstructed from x̂ (known rolling gain C)
+u_k     = π_θ([e_k, u_ff,k])      6-D policy input (error + feed-forward)
 obs  = env.measure(state)          # y: position-only, noisy, delayed
 x̂    = kalman.update(y, u_prev)    # full-state estimate
-u    = π(r − x̂)                    # policy acts on the estimate
+u    = π(x̂ − r)                    # policy acts on the estimate
 u_eff = env.actuate(u)             # gained, delayed, clamped
 state = env.step(state, u_eff, k)  # damping + C·scale + disturbance
 ```
 
 The Kalman filter uses the nominal plant model (`A`, `B`, `H=[I 0]`) and is
 **delay-aware** (it corrects the buffered prior at the measurement's time index,
-then re-propagates). Damping, actuator gain/delay and disturbances are deliberately
-unmodelled in the filter, so estimation degrades gracefully — the honest
-robustness signal.
+then re-propagates).
+
+What the filter **does** model: the nominal double-integrator plant, the sensor
+delay, and the measurement noise (`R` matched to `sensor_noise_pos`).
+What it does **not** model: actuator delay, actuator gain/bias, damping and
+`c_scale`. Those mismatches are deliberate — estimation degrades gracefully there,
+which is the honest robustness signal.
 
 The recorded `trajectory`/`tracking_error` are always the **true** plant state;
 `measurements`, `estimates`, `estimation_pos_rmse_cm` and `estimation_vel_rmse`
 expose the observation/estimation side. Distillation (`clean` **and** `robust`)
 generates labels from closed-loop teacher rollouts through the same filter, so the
-students learn `π(r − x̂)`.
+students learn `π(x̂ − r)`; the feed-forward channel `u_ff` is likewise
+reconstructed from `x̂` (see `ReferenceAccelEstimator`), never from ground truth.
 
 ## Presets (`EMBODIMENT_PRESETS`)
 
-`clean` (the original), `noisy`, `delayed` (sensor 3 / actuator 2 frames ≈ 60/40 ms),
-`perturbed` (impulse every 60 frames, σ 0.15 m/s), `heavy` (damping 0.6, c_scale 0.8),
-`embodied` (mild noise + delay + impulses + lossy body — the dashboard default),
-`randomized` (seeded per-episode randomisation).
+`clean` (ideal sensing but the Kalman estimator still reconstructs velocity),
+`noisy` (position σ 5 mm), `delayed` (sensor 3 / actuator 2 frames ≈ 60/40 ms),
+`perturbed` (a 0.15 m/s **velocity** kick every 60 frames), `heavy` (damping 0.6,
+c_scale 0.8), `embodied` (σ 4 mm + sensor 2 / actuator 1 frames + a 0.12 m/s kick
+every 80 frames + damping 0.3 + c_scale 0.9 — the dashboard default), `randomized`
+(seeded per-episode randomisation).
 
 ## Training profiles
 

@@ -18,7 +18,7 @@ are merged shallowly; a few flat convenience keys are also accepted.
 
 ```jsonc
 {
-  "steps": 250,            // control frames in the orbit  (flat -> benchmark.steps)
+  "steps": 500,            // control frames in the orbit  (flat -> benchmark.steps)
   "radius": 0.15,          // orbit radius [m]
   "freq": 0.5,             // orbit frequency [Hz]
   "init_state": [-0.05, 0.05, 0.0, 0.0],
@@ -72,7 +72,7 @@ Names are resolved forgivingly (`-`/space → `_`, lowercase, alias map), so
 
 ```jsonc
 {
-  "reference": {"kind": "orbit", "steps": 250, "dt": 0.02, "radius": 0.15, "freq": 0.5,
+  "reference": {"kind": "orbit", "steps": 500, "dt": 0.02, "radius": 0.15, "freq": 0.5,
                 "pos": [[x,y], ...], "vel": [[vx,vy], ...], "acc": [[ax,ay], ...]},
   "init_state": [-0.05, 0.05, 0.0, 0.0],
   "config": { ... resolved config ... },
@@ -117,7 +117,7 @@ Session descriptor:
 
 ```json
 {"session_id": "...", "controller": "snn_transferred", "label": "SNN transferred",
- "steps_total": 250, "step": 0, "dt": 0.02, "radius": 0.15, "freq": 0.5,
+ "steps_total": 500, "step": 0, "dt": 0.02, "radius": 0.15, "freq": 0.5,
  "init_state": [-0.05, 0.05, 0.0, 0.0], "controller_info": { ... }}
 ```
 

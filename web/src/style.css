@@ -163,7 +163,7 @@ body {
 .canvas-wrap { flex: 1 1 auto; min-height: 0; position: relative; }
 #spikes, #control-out, #tracking { display: block; width: 100%; height: 100%; }
 
-/* controller pipeline ----------------------------------------------------- */
+/* controller pipeline (closed-loop chain) --------------------------------- */
 .pipeline {
   flex: 1 1 auto;
   min-height: 0;
@@ -173,62 +173,51 @@ body {
   flex-direction: column;
   gap: 0;
 }
-.pipeline-node {
+.pipe-row {
   flex: 0 0 auto;
-  border: 1px solid var(--border);
-  border-radius: 9px;
-  padding: 6px 10px;
-  background: rgba(13, 19, 32, .55);
-  opacity: .55;
-  transition: opacity .3s ease, border-color .3s ease, box-shadow .3s ease;
+  display: grid;
+  grid-template-columns: 16px 62px minmax(0, 1fr);
+  align-items: start;
+  gap: 10px;
+  padding: 6px 0;
+  opacity: .5;
+  transition: opacity .3s ease, color .3s ease;
 }
-.pipeline-node.on { opacity: 1; border-color: var(--accent); }
-.pipeline-node.node-snn.on { border-color: var(--snn); box-shadow: inset 0 0 0 1px rgba(126,224,192,.22); }
-.pipeline-node.node-plant.on { border-color: var(--accent-2); }
-.pipeline-node.node-sense { opacity: .92; border-color: #2f6f63; }
-.pn-note { font-size: 9.5px; color: var(--muted); padding: 3px 2px 0; letter-spacing: .03em; }
-.pn-kicker { display: block; font-size: 8.5px; letter-spacing: .1em; color: var(--muted); }
-.pn-title { display: flex; align-items: center; gap: 7px; font-size: 12.5px; font-weight: 700; }
-.spiking-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--snn); display: inline-block; opacity: .35; }
-.pipeline[data-phase="snn"] .spiking-dot,
-.pipeline[data-phase="loop"] .spiking-dot { animation: pulse 1.05s ease-in-out infinite; }
-@keyframes pulse {
-  0%, 100% { opacity: .35; box-shadow: 0 0 0 0 rgba(126,224,192,.5); }
-  50% { opacity: 1; box-shadow: 0 0 0 5px rgba(126,224,192,0); }
-}
-
-.pipe-link {
+.pipe-row.on { opacity: 1; }
+.pr-rule {
   position: relative;
-  flex: 0 0 22px;
-  height: 22px;
-  margin: 3px 0 3px 16px;
+  align-self: stretch;
+  min-height: 16px;
   border-left: 2px dashed var(--border);
-  opacity: .4;
-  transition: opacity .3s ease, border-color .3s ease;
 }
-.pipe-link.on { opacity: 1; border-color: var(--accent); }
-.pipe-label {
+.pipe-row.on .pr-rule { border-left-color: var(--accent); }
+.pr-rule::after {
+  content: "";
   position: absolute;
-  left: 12px;
-  top: 50%;
-  transform: translateY(-50%);
-  font-size: 8.5px;
-  letter-spacing: .07em;
-  color: var(--muted);
-}
-.pipe-link.on .pipe-label { color: var(--accent-2); }
-.pipe-arrow {
-  position: absolute;
-  left: -4.5px; bottom: 0;
+  left: -4.5px; bottom: -1px;
   width: 0; height: 0;
   border-left: 4.5px solid transparent;
   border-right: 4.5px solid transparent;
   border-top: 6px solid var(--border);
 }
-.pipe-link.on .pipe-arrow { border-top-color: var(--accent-2); animation: flow .9s linear infinite; }
-@keyframes flow {
-  0%, 100% { transform: translateY(-2px); opacity: .45; }
-  50% { transform: translateY(2px); opacity: 1; }
+.pipe-row.on .pr-rule::after { border-top-color: var(--accent-2); }
+.pr-label {
+  font-size: 9px;
+  letter-spacing: .1em;
+  font-weight: 700;
+  color: var(--muted);
+  padding-top: 1px;
+}
+.pipe-row.on .pr-label { color: var(--text); }
+.pr-value { font-size: 12px; font-weight: 600; min-width: 0; }
+.pipe-row.node-policy.on .pr-value { color: var(--snn); }
+.pr-sub { display: block; font-size: 10px; font-weight: 400; color: var(--muted); margin-top: 1px; }
+.pn-note {
+  flex: 0 0 auto;
+  font-size: 9.5px;
+  color: var(--muted);
+  padding: 4px 2px 0 26px;
+  letter-spacing: .03em;
 }
 
 /* result bar -------------------------------------------------------------- */
@@ -275,8 +264,8 @@ body {
   .topbar { padding: 7px 16px; }
   .dash { padding: 9px 16px; gap: 9px; }
   .side { gap: 8px; }
-  .pipeline-node { padding: 4px 8px; }
-  .pipe-link { flex-basis: 18px; height: 18px; }
+  .pipe-row { padding: 3px 0; }
+  .pipe-row .pr-sub { display: none; }
   .rb-v { font-size: 18px; }
   .panel h2 { padding: 6px 12px 5px; }
 }

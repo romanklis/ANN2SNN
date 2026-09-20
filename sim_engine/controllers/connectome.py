@@ -201,6 +201,7 @@ class ConnectomeANNController(nn.Module, BaseController):
 
     # -- BaseController ----------------------------------------------------- #
     def reset(self) -> None:
+        super().reset()
         self._h = None
 
     def hidden_state(self, batch: int = 1, dtype=None, device=None) -> torch.Tensor:
@@ -211,11 +212,11 @@ class ConnectomeANNController(nn.Module, BaseController):
             device=device or self.device,
         )
 
-    def _err(self, state: torch.Tensor, ref) -> torch.Tensor:
-        return error_vector(state, ref).to(self.device, dtype=self.dtype)
+    def _input(self, state: torch.Tensor, ref) -> torch.Tensor:
+        return self.policy_input(state, ref).to(self.device, dtype=self.dtype)
 
     def raw_act(self, state: torch.Tensor, ref) -> torch.Tensor:
-        err = self._err(state, ref).unsqueeze(0)
+        err = self._input(state, ref).unsqueeze(0)
         h_prev = self._h if self._h is not None else self.hidden_state(1)
         tilt, h = self.forward(err, h_prev)
         self._h = h
