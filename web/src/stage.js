@@ -68,9 +68,10 @@ export class Stage {
   }
 
   // ------------------------------------------------------------------ data
-  setScene({ reference, series = [], plateHalf = 0.25 }) {
+  setScene({ reference, series = [], plateHalf = 0.25, measurements = null }) {
     this.reference = reference || null;
     this.series = series.filter((s) => s.trajectory && s.trajectory.length);
+    this.measurements = measurements && measurements.length ? measurements : null;
     this.plateHalf = plateHalf || 0.25;
     this.frame = 0;
     this._lastTs = 0;
@@ -316,13 +317,45 @@ export class Stage {
     const balls = [];
     for (const s of this.series) {
       if (k >= s.trajectory.length) continue;
-      balls.push({ s, x: s.trajectory[k][0], y: s.trajectory[k][1], ring: !!s.ring });
+      balls.push({
+        s,
+        x: s.trajectory[k][0],
+        y: s.trajectory[k][1],
+        ring: !!s.ring,
+        est: s.estimates ? s.estimates[k] : null,
+      });
     }
 
     for (const b of balls) {
       const inside = Math.abs(b.x) <= this.plateHalf && Math.abs(b.y) <= this.plateHalf;
       const p = P(clip(b.x), clip(b.y));
       const r = b.ring ? iso.ballR : iso.ballR + 1;
+
+      // camera measurements (position-only, shared): faint recent dots
+      if (this.measurements && k > 0) {
+        const from = Math.max(0, k - 6);
+        for (let i = from; i <= k && i < this.measurements.length; i++) {
+          const mp = P(this.measurements[i][0], this.measurements[i][1]);
+          ctx.globalAlpha = i === k ? 0.85 : 0.10 + 0.25 * ((i - from) / (k - from || 1));
+          ctx.fillStyle = "#e8eef7";
+          ctx.beginPath();
+          ctx.arc(mp.x, mp.y, i === k ? 2.4 : 1.6, 0, Math.PI * 2);
+          ctx.fill();
+        }
+        ctx.globalAlpha = 1;
+      }
+
+      // the controller's belief: hollow ring at the Kalman estimate
+      if (b.est) {
+        const pe = P(clip(b.est[0]), clip(b.est[1]));
+        ctx.strokeStyle = b.s.color;
+        ctx.globalAlpha = 0.9;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.arc(pe.x, pe.y, r * 0.72, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.globalAlpha = 1;
+      }
       const color = inside ? b.s.color : COLORS.off;
 
       // contact shadow on the plate

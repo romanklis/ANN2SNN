@@ -78,6 +78,15 @@
               <span class="pn-kicker">PLANT</span>
               <span class="pn-title">BALL + PLATE</span>
             </div>
+            <div class="pipeline-node node-sense">
+              <span class="pn-kicker">OBSERVATION</span>
+              <span class="pn-title">CAMERA · y = [x, y] + v</span>
+            </div>
+            <div class="pipeline-node node-sense">
+              <span class="pn-kicker">ESTIMATE</span>
+              <span class="pn-title">KALMAN · x̂ = [x, y, vx, vy]</span>
+            </div>
+            <div class="pn-note">controller input: e = r − x̂</div>
           </div>
         </section>
 

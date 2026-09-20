@@ -80,8 +80,13 @@ class EmbodimentConfig:
 
     # -- sensing ------------------------------------------------------------ #
     sensor_noise_pos: float = 0.0     # Gaussian sigma on measured position [m]
-    sensor_noise_vel: float = 0.0     # Gaussian sigma on measured velocity [m/s]
     sensor_delay: int = 0             # observation delay [control frames]
+
+    # -- estimator (always a Kalman filter; the controller never sees x) ---- #
+    estimator: str = "kalman"
+    estimate_process_noise: float = 0.1   # filter process noise sigma [m/s^2]
+    estimate_init_pos_var: float = 0.01
+    estimate_init_vel_var: float = 1.0
 
     # -- actuation ---------------------------------------------------------- #
     actuator_delay: int = 0           # command delay [control frames]
@@ -112,7 +117,6 @@ class EmbodimentConfig:
             return True
         return (
             self.sensor_noise_pos == 0.0
-            and self.sensor_noise_vel == 0.0
             and self.sensor_delay == 0
             and self.actuator_delay == 0
             and self.actuator_gain == 1.0
@@ -143,13 +147,12 @@ class EmbodimentConfig:
 #: is the default story setting (mild noise + delay + impulses + a lossy body).
 EMBODIMENT_PRESETS: Dict[str, dict] = {
     "clean": {},
-    "noisy": {"sensor_noise_pos": 0.005, "sensor_noise_vel": 0.02},
+    "noisy": {"sensor_noise_pos": 0.005},
     "delayed": {"sensor_delay": 3, "actuator_delay": 2},
     "perturbed": {"impulse_interval": 60, "impulse_std": 0.15},
     "heavy": {"damping": 0.6, "c_scale": 0.8},
     "embodied": {
         "sensor_noise_pos": 0.004,
-        "sensor_noise_vel": 0.015,
         "sensor_delay": 2,
         "actuator_delay": 1,
         "impulse_interval": 80,
@@ -196,6 +199,9 @@ class TrainingConfig:
     episodes: int = 4
     episode_steps: int = 250
     noise_augment: float = 0.0
+    #: extra i.i.d. error samples added to the closed-loop dataset so the student
+    #: also learns the large-error corrections the near-perfect teacher never visits
+    coverage_samples: int = 2048
 
     def to_dict(self) -> dict:
         return dataclasses.asdict(self)
@@ -251,7 +257,6 @@ class EngineConfig:
     embodiment: Optional[EmbodimentConfig] = None
     embodiment_preset: Optional[str] = None
     sensor_noise_pos: Optional[float] = None
-    sensor_noise_vel: Optional[float] = None
     sensor_delay: Optional[int] = None
     actuator_delay: Optional[int] = None
     disturbance_std: Optional[float] = None   # -> process_noise
@@ -288,7 +293,7 @@ class EngineConfig:
             t.lr = float(self.lr)
 
         # Embodiment: an explicit config wins, otherwise a preset + flat fields.
-        flat = (self.sensor_noise_pos, self.sensor_noise_vel, self.sensor_delay,
+        flat = (self.sensor_noise_pos, self.sensor_delay,
                 self.actuator_delay, self.disturbance_std, self.damping, self.c_scale)
         if self.embodiment is not None:
             b.embodiment = self.embodiment
@@ -296,8 +301,6 @@ class EngineConfig:
             cfg = EmbodimentConfig.from_preset(self.embodiment_preset or "clean")
             if self.sensor_noise_pos is not None:
                 cfg.sensor_noise_pos = float(self.sensor_noise_pos)
-            if self.sensor_noise_vel is not None:
-                cfg.sensor_noise_vel = float(self.sensor_noise_vel)
             if self.sensor_delay is not None:
                 cfg.sensor_delay = int(self.sensor_delay)
             if self.actuator_delay is not None:

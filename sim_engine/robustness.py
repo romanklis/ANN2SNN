@@ -37,7 +37,6 @@ def build_env_config(axis: str, point, base: Optional[EmbodimentConfig] = None) 
     cfg = EmbodimentConfig(preset=axis, seed=base.seed)
     if axis == "noise":
         cfg.sensor_noise_pos = float(point)
-        cfg.sensor_noise_vel = float(point) * 3.0
     elif axis == "delay":
         d = int(point)
         cfg.sensor_delay = d

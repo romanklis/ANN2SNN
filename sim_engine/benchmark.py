@@ -25,6 +25,7 @@ import torch
 from .config import BenchmarkConfig
 from .controllers.base import BaseController
 from .environment import EmbodiedEnv
+from .estimators import KalmanFilter
 from .physics import DT, PLATE_HALF, step_physics
 from .reference import Reference, orbit_reference
 from .serialization import to_jsonable
@@ -61,6 +62,12 @@ class TrajectoryResult:
     max_recovery_step: Optional[int] = None
     disturbance_rms: Optional[float] = None
     env: Optional[dict] = None
+    #: estimation (camera measurement -> Kalman estimate) traces + errors
+    measurements: Optional[np.ndarray] = None   # (T, 2) camera y
+    estimates: Optional[np.ndarray] = None      # (T, 4) x̂ fed to the controller
+    estimation_pos_rmse_cm: Optional[float] = None
+    estimation_vel_rmse: Optional[float] = None
+    estimator: Optional[dict] = None
 
     def to_dict(self, include_trace: bool = True) -> dict:
         d = {
@@ -82,14 +89,24 @@ class TrajectoryResult:
             d["metrics"]["max_recovery_step"] = self.max_recovery_step
         if self.disturbance_rms is not None:
             d["metrics"]["disturbance_rms"] = self.disturbance_rms
+        if self.estimation_pos_rmse_cm is not None:
+            d["metrics"]["estimation_pos_rmse_cm"] = self.estimation_pos_rmse_cm
+        if self.estimation_vel_rmse is not None:
+            d["metrics"]["estimation_vel_rmse"] = self.estimation_vel_rmse
         if self.recovery_steps is not None:
             d["recovery_steps"] = list(self.recovery_steps)
         if self.env is not None:
             d["env"] = dict(self.env)
+        if self.estimator is not None:
+            d["estimator"] = dict(self.estimator)
         if include_trace:
             d["trajectory"] = self.trajectory.tolist()
             d["tilts"] = self.tilts.tolist()
             d["tracking_error"] = self.tracking_error.tolist()
+            if self.measurements is not None:
+                d["measurements"] = self.measurements.tolist()
+            if self.estimates is not None:
+                d["estimates"] = self.estimates.tolist()
         if self.spikes is not None:
             d["spikes"] = self.spikes.tolist()
         return to_jsonable(d)
@@ -152,6 +169,7 @@ def run_closed_loop(
     record_spikes: Optional[bool] = None,
     name: Optional[str] = None,
     env: Optional[EmbodiedEnv] = None,
+    estimator: Optional[KalmanFilter] = None,
 ) -> TrajectoryResult:
     """Roll the plant + controller forward over the whole reference trajectory.
 
@@ -175,8 +193,18 @@ def run_closed_loop(
     state = torch.as_tensor(init_state, dtype=torch.float32, device=device).clone()
 
     use_env = env is not None
+    kf: Optional[KalmanFilter] = None
     if use_env:
         env.reset()
+        kf = estimator or KalmanFilter(
+            dt=reference.dt,
+            process_noise=env.config.estimate_process_noise,
+            meas_noise=max(float(env.config.sensor_noise_pos), 1e-4),
+            delay=env.sensor_delay,
+            init_pos_var=env.config.estimate_init_pos_var,
+            init_vel_var=env.config.estimate_init_vel_var,
+        )
+        kf.reset()
 
     controller.reset()
 
@@ -185,14 +213,23 @@ def run_closed_loop(
     spikes: List[np.ndarray] = []
     disturbances: List[np.ndarray] = []
     impulse_frames: List[int] = []
+    measurements: List[np.ndarray] = []
+    estimates: List[np.ndarray] = []
     wants_spikes = bool(record_spikes and getattr(controller, "spiking", False))
+    u_prev = torch.zeros(2, dtype=state.dtype, device=device)
 
     with torch.no_grad():
         for k in range(steps):
             traj.append(state.detach().cpu().numpy().copy())
             ref_k = reference.at(k)
-            observation = env.observe(state) if use_env else state
-            u = controller.act(observation, ref_k)
+            if use_env:
+                y = env.measure(state)                 # camera: position only
+                xhat = kf.update(y, u_prev)            # KF: full-state estimate
+                measurements.append(y.detach().cpu().numpy().copy())
+                estimates.append(xhat.detach().cpu().numpy().copy())
+                u = controller.act(xhat, ref_k)        # policy acts on r − x̂
+            else:
+                u = controller.act(state, ref_k)
             tilts.append(u.detach().cpu().numpy().copy())
             if wants_spikes:
                 spk = controller.last_spikes()
@@ -206,6 +243,7 @@ def run_closed_loop(
                     impulse_frames.append(k)
             else:
                 state = step_physics(state, u, dt=reference.dt)
+            u_prev = u
 
     trajectory = np.asarray(traj)
     tilt_arr = np.asarray(tilts)
@@ -222,6 +260,7 @@ def run_closed_loop(
             break
 
     on_plate_pct = impulse_count = recovery = max_recovery = drms = env_meta = None
+    est_pos_rmse = est_vel_rmse = None
     if use_env:
         pos = trajectory[:, :2]
         inside = np.all(np.abs(pos) <= PLATE_HALF, axis=1)
@@ -243,6 +282,15 @@ def run_closed_loop(
             drms = float(np.sqrt(np.mean(np.sum(da ** 2, axis=1))))
         env_meta = env.describe()
 
+        # estimation error: x̂ (what the controller saw) vs the true state
+        if estimates:
+            ea = np.asarray(estimates)
+            T = min(len(err), len(ea))
+            pos_err = np.linalg.norm(ea[:T, :2] - trajectory[:T, :2], axis=1) * 100.0
+            vel_err = np.linalg.norm(ea[:T, 2:] - trajectory[:T, 2:], axis=1)
+            est_pos_rmse = float(np.sqrt(np.mean(pos_err ** 2)))
+            est_vel_rmse = float(np.sqrt(np.mean(vel_err ** 2)))
+
     return TrajectoryResult(
         name=name or controller.name,
         trajectory=trajectory,
@@ -261,6 +309,11 @@ def run_closed_loop(
         max_recovery_step=max_recovery,
         disturbance_rms=drms,
         env=env_meta,
+        measurements=np.asarray(measurements) if measurements else None,
+        estimates=np.asarray(estimates) if estimates else None,
+        estimation_pos_rmse_cm=est_pos_rmse,
+        estimation_vel_rmse=est_vel_rmse,
+        estimator=kf.describe() if kf is not None else None,
     )
 
 
@@ -283,9 +336,10 @@ def evaluate(
         init_state = torch.tensor([-0.05, 0.05, 0.0, 0.0])
 
     embodiment = getattr(config, "embodiment", None)
-    use_env = bool(
-        embodiment is not None and embodiment.enable and not embodiment.is_clean
-    )
+    # The estimator is always on: even a "clean" run estimates velocity from
+    # position-only measurements (zero noise/delay), so the controller never sees
+    # the true state.
+    use_env = bool(embodiment is not None and embodiment.enable)
     init_tuple = tuple(float(v) for v in init_state)
 
     results: Dict[str, TrajectoryResult] = {}

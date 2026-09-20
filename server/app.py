@@ -294,7 +294,6 @@ def _validate_embodiment(cfg: EmbodimentConfig) -> None:
     """Bound environmental difficulty so a request cannot be pathological."""
     checks = [
         ("sensor_noise_pos", cfg.sensor_noise_pos, 0.0, 0.05),
-        ("sensor_noise_vel", cfg.sensor_noise_vel, 0.0, 0.20),
         ("sensor_delay", cfg.sensor_delay, 0, 20),
         ("actuator_delay", cfg.actuator_delay, 0, 20),
         ("actuator_gain", cfg.actuator_gain, 0.1, 3.0),
@@ -587,7 +586,7 @@ def _run_one(controller: str, *, steps: int, radius: float, freq: float, seed: i
     init_state = torch.tensor(engine.config.plant.init_state, dtype=torch.float32)
 
     env = None
-    if not emb.is_clean:
+    if emb.enable:
         env = EmbodiedEnv(emb, dt=reference.dt, max_tilt=MAX_TILT,
                           init_state=engine.config.plant.init_state)
 
@@ -619,7 +618,7 @@ def _run_one(controller: str, *, steps: int, radius: float, freq: float, seed: i
     }
     if payload is not None:
         out["spikes"] = payload
-    out["env"] = None if emb.is_clean else emb.to_dict()
+    out["env"] = emb.to_dict() if emb.enable else None
     return out
 
 
@@ -704,7 +703,7 @@ def _run_many(controllers: Sequence[str], *, steps: int, radius: float, freq: fl
         "ok": True,
         "trained": trained_registry,
         "profile": profile,
-        "env": None if emb.is_clean else emb.to_dict(),
+        "env": emb.to_dict() if emb.enable else None,
         "seed": seed,
         "steps": steps,
         "radius": radius,
@@ -824,6 +823,8 @@ def create_app(config: Optional[Dict[str, Any]] = None) -> Flask:
             training=engine_training,
             profiles=["clean", "robust"],
             default_profile="clean",
+            estimator="kalman",
+            estimator_note="controller input is r − x̂ (Kalman estimate from position-only measurements)",
             embodiment_presets=embodiment_specs(),
             default_embodiment_preset="embodied",
             robustness_axes=list(DEFAULT_AXIS_POINTS),

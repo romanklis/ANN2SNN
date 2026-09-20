@@ -190,10 +190,12 @@ async function loadOnce() {
     stage.setScene({
       reference: body.reference,
       series: [
-        { name: ANN, color: ANN_COLOR, trajectory: ann.trajectory || [] },
-        { name: SNN, color: SNN_COLOR, trajectory: snn.trajectory || [], ring: true },
+        { name: ANN, color: ANN_COLOR, trajectory: ann.trajectory || [], estimates: ann.estimates },
+        { name: SNN, color: SNN_COLOR, trajectory: snn.trajectory || [],
+          estimates: snn.estimates, ring: true },
       ],
       plateHalf: body.stats?.plate_half_m ?? cat.plate_half ?? 0.25,
+      measurements: snn.measurements || ann.measurements || null,
     });
     stage.setLoop(true);
 
@@ -262,8 +264,10 @@ function buildResultBar(ann, snn) {
   const delta = (annErr != null && snnErr != null) ? snnErr - annErr : null;
   el.resultDelta.textContent = signed(delta);
   el.resultDelta.parentElement.title = "difference (SNN − ANN)";
+  const est = stats[SNN]?.estimation_pos_rmse_cm;
   el.resultNote.textContent =
-    `closed-loop radial tracking error · Δ = SNN − ANN · env ${state.envPreset} · policy ${state.profile}`;
+    `closed-loop radial tracking error · Δ = SNN − ANN · env ${state.envPreset} · policy ${state.profile}` +
+    (est != null ? ` · x̂ RMSE ${fmt(est)} cm` : "");
 }
 
 // ---------------------------------------------------------------- capture

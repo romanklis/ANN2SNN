@@ -15,6 +15,22 @@ rolling ball on a prescribed 2D orbit by tilting a plate:
 | **SNN transferred** | `LosslessConnectomeSNN` | IF spiking transfer of the connectome ANN |
 | **Dense ANN (distilled)** | `DenseNNController` (trained) | behavioral distillation of the PID teacher |
 
+The closed loop is the canonical control/estimation separation — the controller
+never sees the true state:
+
+```
+x_{k+1} = f(x_k, u_k) + w_k
+y_k     = h(x_k) + v_k            h(x) = [x, y]     (camera: position only)
+x̂_k     = E(y_{0:k}, u_{0:k-1})                    E = Kalman filter
+e_k     = r_k − x̂_k
+u_k     = π_θ(e_k)
+```
+
+`π_ANN → π_SNN` is an **offline** weight transfer; both networks are inserted into
+this identical loop, so the ANN/SNN comparison holds the plant and reference fixed.
+The body/environment (sensor noise, sensor/actuator delay, damping, scaled rolling
+gain, perturbations) is configurable via presets — see [`docs/EMBODIMENT.md`](docs/EMBODIMENT.md).
+
 ---
 
 ## Install
@@ -141,6 +157,9 @@ sim_engine/
 │   ├── connectome.py   # ConnectomeTopology, ConnectomeANNController
 │   └── snn.py          # LosslessConnectomeSNN
 ├── training.py         # behavioral distillation + weight save/load
+├── environment.py      # embodied env: sensing, actuation, body, perturbations
+├── estimators.py       # Kalman filter (position-only camera -> full state)
+├── robustness.py       # environmental difficulty sweeps
 ├── benchmark.py        # closed-loop trajectory evaluation + metrics
 ├── registry.py         # name -> controller factory (demo brains)
 ├── engine.py           # Engine + SimulationSession

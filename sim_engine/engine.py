@@ -34,6 +34,7 @@ from .config import (
 )
 from .controllers import BaseController
 from .environment import EmbodiedEnv
+from .estimators import KalmanFilter
 from .physics import BallPlatePlant, step_physics
 from .reference import Reference, orbit_reference
 from .registry import ControllerRegistry, LABELS
@@ -77,24 +78,20 @@ class Engine:
         do_train = self.config.train_on_init if train is None else train
         if do_train:
             profile = getattr(self.config.training, "profile", "clean")
-            if profile == "robust":
-                # Distil the teacher inside the same embodied environment the
-                # controller will be evaluated in (noise/delay/perturbations).
-                train_cfg = dataclasses.replace(
-                    self.config.training,
-                    embodiment=self.config.training.embodiment
-                    or self.config.benchmark.embodiment,
-                )
-                distilled = training_mod.distill_embodied(
-                    self.config.network,
-                    train_cfg,
-                    benchmark=self.config.benchmark,
-                    log_fn=self._log,
-                )
-            else:
-                distilled = training_mod.distill(
-                    self.config.network, self.config.training, log_fn=self._log
-                )
+            # Closed-loop distillation for both profiles: the teacher acts on the
+            # Kalman estimate x̂ (position-only camera), never the true state.
+            train_cfg = dataclasses.replace(
+                self.config.training,
+                embodiment=self.config.training.embodiment
+                or self.config.benchmark.embodiment,
+            )
+            distilled = training_mod.distill_profile(
+                profile,
+                self.config.network,
+                train_cfg,
+                benchmark=self.config.benchmark,
+                log_fn=self._log,
+            )
             dense = distilled["dense"]
             connectome = distilled["connectome"]
             self.last_training = {
@@ -163,7 +160,7 @@ class Engine:
         cfg = config or self.config.benchmark
         emb = getattr(cfg, "embodiment", None)
         env = None
-        if emb is not None and emb.enable and not emb.is_clean:
+        if emb is not None and emb.enable:
             env = EmbodiedEnv(
                 emb,
                 dt=self.config.plant.dt,
@@ -287,7 +284,8 @@ class SimulationSession:
         self.controller = engine.build_controller(self.name)
         emb = engine.config.benchmark.embodiment
         self.env = None
-        if emb is not None and emb.enable and not emb.is_clean:
+        self.estimator = None
+        if emb is not None and emb.enable:
             self.env = EmbodiedEnv(
                 emb,
                 dt=engine.config.plant.dt,
@@ -295,6 +293,16 @@ class SimulationSession:
                 device=engine.device,
                 init_state=self.init_state,
             )
+            self.estimator = KalmanFilter(
+                dt=engine.config.plant.dt,
+                process_noise=emb.estimate_process_noise,
+                meas_noise=max(float(emb.sensor_noise_pos), 1e-4),
+                delay=self.env.sensor_delay,
+                init_pos_var=emb.estimate_init_pos_var,
+                init_vel_var=emb.estimate_init_vel_var,
+                device=engine.device,
+            )
+        self._u_prev = torch.zeros(2, dtype=torch.float32, device=engine.device)
         self.k = 0
         self.done = False
         self.history: Dict[str, list] = {"state": [], "tilt": [], "error_cm": [], "target": []}
@@ -306,6 +314,9 @@ class SimulationSession:
         self.plant.reset()
         if self.env is not None:
             self.env.reset()
+        if self.estimator is not None:
+            self.estimator.reset()
+        self._u_prev = torch.zeros(2, dtype=torch.float32, device=self.engine.device)
         self.k = 0
         self.done = False
         self.history = {"state": [], "tilt": [], "error_cm": [], "target": []}
@@ -324,11 +335,16 @@ class SimulationSession:
 
         state = self.plant.state
         if action is None:
-            observation = self.env.observe(state) if self.env is not None else state
+            if self.env is not None:
+                y = self.env.measure(state)                    # camera: position only
+                xhat = self.estimator.update(y, self._u_prev)  # Kalman estimate
+            else:
+                xhat = state
             with torch.no_grad():
-                tilt = self.controller.act(observation, self.reference.at(self.k))
+                tilt = self.controller.act(xhat, self.reference.at(self.k))
         else:
             tilt = torch.as_tensor(action, dtype=torch.float32, device=self.engine.device)
+        self._u_prev = tilt.detach()
 
         if self.env is not None:
             applied = self.env.actuate(tilt)

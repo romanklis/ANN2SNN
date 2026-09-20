@@ -31,6 +31,7 @@ from .config import BenchmarkConfig, EmbodimentConfig, NetworkConfig, TrainingCo
 from .controllers import ClassicalPDController, ConnectomeANNController, DenseNNController
 from .controllers.base import error_vector
 from .environment import EmbodiedEnv
+from .estimators import KalmanFilter
 from .physics import MAX_TILT, SYNAPSES_PER_NEURON
 from .reference import orbit_reference
 
@@ -41,8 +42,9 @@ __all__ = [
     "train_connectome_controller",
     "distill",
     "distill_embodied",
+    "distill_closed_loop",
     "distill_profile",
-    "generate_embodied_episodes",
+    "generate_closed_loop_episodes",
     "save_weights",
     "load_weights",
 ]
@@ -218,39 +220,57 @@ def distill(
 # --------------------------------------------------------------------------- #
 # Embodied ("robust") distillation: distil the PD teacher inside the env
 # --------------------------------------------------------------------------- #
-def generate_embodied_episodes(
+def generate_closed_loop_episodes(
     teacher: ClassicalPDController,
     config: TrainingConfig,
     benchmark: Optional[BenchmarkConfig] = None,
     *,
+    embodiment: Optional[EmbodimentConfig] = None,
     log_fn=None,
 ) -> list:
-    """Roll the PD teacher inside an embodied env and collect (error, label) pairs.
+    """Roll the PD teacher through the closed loop (camera + Kalman) and label it.
 
-    The teacher observes exactly what a student will observe (noisy, delayed) and
-    acts through the same actuator model, so the labels are the deployed control
-    law rather than the ideal one.  Returns one dict per episode with ``errors``
-    ``(E, 4)`` and ``labels`` ``(E, 2)``.
+    The teacher observes only ``x̂`` — the Kalman estimate of the full state from
+    position-only measurements — and acts through the same actuator model, so the
+    labels are the *deployed* control law ``π(r − x̂)`` rather than the idealized
+    ``π(r − x)``.  Returns one dict per episode with ``errors`` ``(E, 4)`` and
+    ``labels`` ``(E, 2)``.
     """
     benchmark = benchmark or BenchmarkConfig(steps=int(config.episode_steps))
-    embodiment = config.embodiment or EmbodimentConfig.from_preset("embodied")
+    if embodiment is None:
+        embodiment = config.embodiment or EmbodimentConfig.from_preset(
+            "embodied" if config.profile == "robust" else "clean"
+        )
     steps = int(config.episode_steps)
     ref = orbit_reference(steps=steps, radius=benchmark.radius, freq=benchmark.freq)
     env = EmbodiedEnv(embodiment, dt=ref.dt, max_tilt=MAX_TILT, device=config.device)
+    kf = KalmanFilter(
+        dt=ref.dt,
+        process_noise=embodiment.estimate_process_noise,
+        meas_noise=max(float(embodiment.sensor_noise_pos), 1e-4),
+        delay=env.sensor_delay,
+        init_pos_var=embodiment.estimate_init_pos_var,
+        init_vel_var=embodiment.estimate_init_vel_var,
+        device=config.device,
+    )
 
     episodes = []
     for ep in range(int(config.episodes)):
         env.reset(seed=int(config.seed) + ep)
+        kf.reset()
         state = torch.tensor([-0.05, 0.05, 0.0, 0.0], dtype=torch.float32, device=config.device)
+        u_prev = torch.zeros(2, dtype=torch.float32, device=config.device)
         errs, labels = [], []
         with torch.no_grad():
             for k in range(steps):
-                observation = env.observe(state)
-                err = error_vector(observation, ref.at(k))
+                y = env.measure(state)                    # camera: position only
+                xhat = kf.update(y, u_prev)               # Kalman estimate
+                err = error_vector(xhat, ref.at(k))       # teacher sees r − x̂
                 errs.append(err)
                 labels.append(pd_target(err.unsqueeze(0), teacher)[0])
-                u = teacher.act(observation, ref.at(k))
+                u = teacher.act(xhat, ref.at(k))
                 state = env.step(state, env.actuate(u), k)
+                u_prev = u
         episodes.append({"errors": torch.stack(errs), "labels": torch.stack(labels)})
         if log_fn:
             log_fn("data", ep + 1, 0.0)
@@ -371,11 +391,37 @@ def distill_embodied(
     benchmark: Optional[BenchmarkConfig] = None,
     log_fn=None,
 ) -> Dict[str, object]:
-    """Robust profile: distil both students from the embodied PD teacher."""
-    network = network or NetworkConfig()
+    """Robust profile: distil both students from the embodied closed-loop teacher."""
     config = config or TrainingConfig(profile="robust")
     if config.profile != "robust":
         config = dataclasses.replace(config, profile="robust")
+    return distill_closed_loop(
+        "robust", network, config,
+        dense=dense, connectome=connectome, benchmark=benchmark, log_fn=log_fn,
+    )
+
+
+def distill_closed_loop(
+    profile: str = "clean",
+    network: Optional[NetworkConfig] = None,
+    config: Optional[TrainingConfig] = None,
+    *,
+    dense: Optional[DenseNNController] = None,
+    connectome: Optional[ConnectomeANNController] = None,
+    benchmark: Optional[BenchmarkConfig] = None,
+    log_fn=None,
+) -> Dict[str, object]:
+    """Distil π(r − x̂) from closed-loop teacher rollouts through the Kalman filter.
+
+    Used for **both** profiles: ``clean`` runs the nominal plant (no measurement
+    noise, no delay, no disturbances) but still estimates velocity from
+    position-only measurements; ``robust`` runs the embodied environment.
+    """
+    network = network or NetworkConfig()
+    config = config or TrainingConfig(profile=profile)
+    if config.profile != profile:
+        config = dataclasses.replace(config, profile=profile)
+    profile = config.profile
 
     device = config.device
     if dense is None:
@@ -393,8 +439,25 @@ def distill_embodied(
             seed=config.seed, device=device,
         )
 
+    setup = EmbodimentConfig.from_preset("embodied" if profile == "robust" else "clean")
     teacher = ClassicalPDController(device=device)
-    episodes = generate_embodied_episodes(teacher, config, benchmark, log_fn=log_fn)
+    episodes = generate_closed_loop_episodes(
+        teacher, config, benchmark,
+        embodiment=config.embodiment or setup,
+        log_fn=log_fn,
+    )
+    n_episodes = len(episodes)
+
+    # Coverage: the closed-loop teacher tracks so well that it visits only tiny
+    # errors, so add i.i.d. samples labelled by the same PD law. Without this the
+    # student never learns the large-error corrections it needs to recover.
+    if int(config.coverage_samples) > 0:
+        extra = sample_errors(
+            int(config.coverage_samples), config.error_scale,
+            network.n_in, device, next(dense.parameters()).dtype,
+        )
+        episodes.append({"errors": extra, "labels": pd_target(extra, teacher)})
+
     dense_hist = train_dense_embodied(dense, episodes, config, log_fn=log_fn)
     conn_hist = train_connectome_embodied(connectome, episodes, config, log_fn=log_fn)
 
@@ -408,7 +471,7 @@ def distill_embodied(
             "connectome": conn_hist["final_loss"],
         },
         "config": config.to_dict(),
-        "episodes": len(episodes),
+        "episodes": n_episodes,
     }
 
 
@@ -422,16 +485,14 @@ def distill_profile(
     benchmark: Optional[BenchmarkConfig] = None,
     log_fn=None,
 ) -> Dict[str, object]:
-    """Dispatch to the clean or robust distillation path."""
+    """Distil the closed-loop teacher for the requested profile (clean or robust)."""
     config = config or TrainingConfig()
     if profile and profile != config.profile:
         config = dataclasses.replace(config, profile=profile)
-    if config.profile == "robust":
-        return distill_embodied(
-            network, config, dense=dense, connectome=connectome,
-            benchmark=benchmark, log_fn=log_fn,
-        )
-    return distill(network, config, dense=dense, connectome=connectome, log_fn=log_fn)
+    return distill_closed_loop(
+        config.profile, network, config,
+        dense=dense, connectome=connectome, benchmark=benchmark, log_fn=log_fn,
+    )
 
 
 # --------------------------------------------------------------------------- #

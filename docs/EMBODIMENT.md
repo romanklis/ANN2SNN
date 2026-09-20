@@ -14,8 +14,10 @@ timing/magnitudes), so comparisons are fair.
 
 | group | knob | meaning |
 |---|---|---|
-| sensing | `sensor_noise_pos` / `sensor_noise_vel` | Gaussian σ on measured position [m] / velocity [m/s] |
+| sensing | `sensor_noise_pos` | Gaussian σ on the measured position [m] |
 | sensing | `sensor_delay` | observation delay [control frames] |
+| estimation | `estimator` | always `kalman` — velocity is **not** measured |
+| estimation | `estimate_process_noise` / `estimate_init_pos_var` / `estimate_init_vel_var` | filter tuning |
 | actuation | `actuator_delay` | command delay [control frames] |
 | actuation | `actuator_gain` / `actuator_bias` | scale / offset of the plate command |
 | body | `damping` | velocity damping `b` [1/s] (`a -= b·v`) |
@@ -24,16 +26,33 @@ timing/magnitudes), so comparisons are fair.
 | perturbation | `impulse_interval` / `impulse_prob` / `impulse_std` | scheduled / random kicks [m/s] |
 | randomisation | `randomize` + ranges | resample `c_scale`/`damping` each `reset()` |
 
-The closed loop becomes:
+The closed loop becomes the canonical estimation/control separation — the
+controller **never sees the true state**:
 
 ```
-obs  = env.observe(state)          # noisy, delayed
-u    = controller.act(obs, ref_k)
+x_{k+1} = f(x_k, u_k) + w_k
+y_k     = h(x_k) + v_k            h(x) = [x, y]      (camera: position only)
+x̂_k     = E(y_{0:k}, u_{0:k-1})                     E = Kalman filter
+e_k     = r_k − x̂_k
+u_k     = π_θ(e_k)
+obs  = env.measure(state)          # y: position-only, noisy, delayed
+x̂    = kalman.update(y, u_prev)    # full-state estimate
+u    = π(r − x̂)                    # policy acts on the estimate
 u_eff = env.actuate(u)             # gained, delayed, clamped
 state = env.step(state, u_eff, k)  # damping + C·scale + disturbance
 ```
 
-The recorded `trajectory`/`tracking_error` are always the **true** plant state.
+The Kalman filter uses the nominal plant model (`A`, `B`, `H=[I 0]`) and is
+**delay-aware** (it corrects the buffered prior at the measurement's time index,
+then re-propagates). Damping, actuator gain/delay and disturbances are deliberately
+unmodelled in the filter, so estimation degrades gracefully — the honest
+robustness signal.
+
+The recorded `trajectory`/`tracking_error` are always the **true** plant state;
+`measurements`, `estimates`, `estimation_pos_rmse_cm` and `estimation_vel_rmse`
+expose the observation/estimation side. Distillation (`clean` **and** `robust`)
+generates labels from closed-loop teacher rollouts through the same filter, so the
+students learn `π(r − x̂)`.
 
 ## Presets (`EMBODIMENT_PRESETS`)
 
@@ -81,6 +100,10 @@ Heavy · Embodied · Randomized, default **Embodied**) and a `clean`/`robust`
 policy pill. Selecting an embodied preset uses the **robust** policy
 (auto-distilled and cached on first use). A thin **robustness strip** in the
 footer shows the ANN/SNN mean error across every preset for the current policy.
+The hero stage draws the **camera measurement** (faint dot), the **true** ball,
+and the controller's **estimate** (hollow ring); the pipeline includes
+`CAMERA (y) → KALMAN (x̂)` before the controller, and the result bar reports the
+estimation RMSE.
 
 ## Fairness rule
 

@@ -93,10 +93,12 @@ class EmbodiedEnv:
             lo, hi = cfg.damping_range
             self.damping = float(self._rng.uniform(lo, hi))
 
-        # Prefill both buffers with the initial state / zero command so the first
-        # frames are not an artificial delayed transient.
+        # Prefill both buffers with the initial position / zero command so the
+        # first frames are not an artificial delayed transient (the camera is
+        # position-only, so the sensor buffer holds 2-D vectors).
+        init_pos = self.init_state[:2].clone()
         self._sensor_buf = deque(
-            [self.init_state.clone() for _ in range(self.sensor_delay + 1)],
+            [init_pos.clone() for _ in range(self.sensor_delay + 1)],
             maxlen=self.sensor_delay + 1,
         )
         zero = torch.zeros(2, dtype=self.dtype, device=self.device)
@@ -110,18 +112,17 @@ class EmbodiedEnv:
         self.last_impulse = False
 
     # --------------------------------------------------------------- sensing
-    def observe(self, state: torch.Tensor) -> torch.Tensor:
-        """Return the (noisy, delayed) state the controller is allowed to see."""
+    def measure(self, state: torch.Tensor) -> torch.Tensor:
+        """Camera measurement ``y = [x, y] + v`` — position only, noisy and delayed.
+
+        Velocity is **not** measured; reconstructing it is the estimator's job.
+        """
         cfg = self.config
-        obs = state.detach().to(self.dtype).clone()
-        if cfg.sensor_noise_pos or cfg.sensor_noise_vel:
-            std = np.array([
-                cfg.sensor_noise_pos, cfg.sensor_noise_pos,
-                cfg.sensor_noise_vel, cfg.sensor_noise_vel,
-            ])
-            noise = self._rng.normal(0.0, std)
-            obs = obs + torch.as_tensor(noise, dtype=self.dtype, device=self.device)
-        self._sensor_buf.append(obs)
+        pos = state.detach().to(self.dtype)[:2].clone()
+        if cfg.sensor_noise_pos:
+            noise = self._rng.normal(0.0, cfg.sensor_noise_pos, size=2)
+            pos = pos + torch.as_tensor(noise, dtype=self.dtype, device=self.device)
+        self._sensor_buf.append(pos)
         return self._sensor_buf[0]
 
     # -------------------------------------------------------------- actuation
@@ -188,7 +189,6 @@ class EmbodiedEnv:
             "enable": bool(cfg.enable),
             "clean": cfg.is_clean,
             "sensor_noise_pos": cfg.sensor_noise_pos,
-            "sensor_noise_vel": cfg.sensor_noise_vel,
             "sensor_delay": self.sensor_delay,
             "actuator_delay": self.actuator_delay,
             "actuator_gain": cfg.actuator_gain,
