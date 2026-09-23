@@ -39,6 +39,9 @@ def build_env_config(axis: str, point, base: Optional[EmbodimentConfig] = None) 
     cfg = EmbodimentConfig(preset=axis, seed=base.seed)
     if axis == "noise":
         cfg.sensor_noise_pos = float(point)
+        # Multi-channel examples have no single position camera: the same axis
+        # scales every nominal channel noise instead (monotone in `point`).
+        cfg.sensor_noise_scale = 1.0 + 100.0 * float(point)
     elif axis == "delay":
         d = int(point)
         cfg.sensor_delay = d

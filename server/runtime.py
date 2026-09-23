@@ -9,7 +9,7 @@ import os
 import threading
 import time
 import uuid
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from sim_engine.api import EngineService
 from sim_engine.config import EmbodimentConfig, NetworkConfig, TrainingConfig
@@ -45,13 +45,14 @@ class Runtime:
         self.auto_train = str(os.environ.get("ANN2SNN_AUTO_TRAIN", "1")).strip().lower() \
             not in {"0", "false", "no", "off"}
         self._engines: Dict[str, EngineService] = {}
-        self._weight_overrides: Dict[str, str] = {}
+        #: ``(example, profile) -> bundle path``; see :meth:`set_weights`.
+        self._weight_overrides: Dict[Tuple[str, str], str] = {}
         self.job: Optional[dict] = None
 
     # -- engine construction ------------------------------------------------ #
     def _weights_path(self, seed: int, profile: str = "clean", example: str = "ball") -> str:
         """Per-(example, profile, seed) weights bundle path."""
-        override = self._weight_overrides.get(profile)
+        override = self._weight_overrides.get((example, profile))
         base = override or self.weights_path
         if not base:
             return ""
@@ -137,12 +138,26 @@ class Runtime:
         except Exception:  # pragma: no cover - defensive
             return False
 
-    def set_weights(self, path: Optional[str], profile: str = "clean") -> None:
+    def set_weights(self, path: Optional[str], profile: Optional[str] = "clean",
+                    example: Optional[str] = "ball") -> None:
+        """Pin (or unpin) the weights bundle used for an ``(example, profile)`` pair.
+
+        The key **must** include the example: bundles are dimensioned by it
+        (6→2 for the ball, 9→3 for the drones), so an override registered while
+        training one example would otherwise be loaded by every other example and
+        fail with a ``state_dict`` size mismatch.  ``set_weights(None,
+        profile=None, example=None)`` clears every override.
+        """
         with self._lock:
             if path:
-                self._weight_overrides[profile] = path
+                key = (example or self.default_example, profile or "clean")
+                self._weight_overrides[key] = path
+            elif profile is None and example is None:
+                self._weight_overrides.clear()
             else:
-                self._weight_overrides.pop(profile, None)
+                self._weight_overrides.pop(
+                    (example or self.default_example, profile or "clean"), None
+                )
             self._engines.clear()
 
     # -- reference helpers -------------------------------------------------- #
@@ -221,7 +236,7 @@ class Runtime:
                 connectome=distilled["connectome"],
                 training=training_meta,
             )
-            self.set_weights(path, profile=profile)
+            self.set_weights(path, profile=profile, example=example)
 
             if self.job is not None and self.job["id"] == job_id:
                 self.job["state"] = "done"

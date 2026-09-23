@@ -90,6 +90,7 @@ from server.validation import (  # noqa: E402
     _as_float,
     _as_int,
     _as_spike_format,
+    _as_trace_level,
     _body,
     _env_from_body,
     _example_from_body,
@@ -103,6 +104,22 @@ try:  # thread-cap the shared torch runtime once
     torch.set_num_threads(max(1, int(_THREADS)))
 except Exception:  # pragma: no cover - defensive
     pass
+
+
+def _example_geometry(body: Dict[str, Any]) -> tuple:
+    """Parse ``example`` + ``radius``/``freq``.
+
+    Radius and frequency default to the **selected example's** own trajectory
+    (the ball's 0.15 m / 0.5 Hz are not the drone's), so an API caller that only
+    names the example still gets a sensible task.
+    """
+    example = _example_from_body(body) or RUNTIME.default_example
+    defaults = get_example(example).defaults or {}
+    radius = _as_float(body.get("radius"), "radius",
+                       float(defaults.get("radius", 0.15)), 0.0, 1.0)
+    freq = _as_float(body.get("freq"), "freq",
+                     float(defaults.get("freq", 0.5)), 0.0, 10.0)
+    return example, radius, freq
 
 # --------------------------------------------------------------------------- #
 # Public constants
@@ -237,7 +254,7 @@ def _reference_payload(reference) -> dict:
 def _run_one(controller: str, *, steps: int, radius: float, freq: float, seed: int,
              record_spikes: bool, spike_format: str, profile: str = "clean",
              embodiment: Optional[EmbodimentConfig] = None,
-             example: str = "ball") -> dict:
+             example: str = "ball", trace_level: str = "short") -> dict:
     """Run a single controller and return the normalised dashboard payload."""
     svc = RUNTIME.service(seed, profile, embodiment, example)
     engine = svc.engine
@@ -248,7 +265,8 @@ def _run_one(controller: str, *, steps: int, radius: float, freq: float, seed: i
     reference = engine.reference(steps=steps, radius=radius, freq=freq)
     emb = embodiment or EmbodimentConfig()
     bc = BenchmarkConfig(steps=steps, radius=radius, freq=freq,
-                         record_spikes=record_spikes, embodiment=emb, example=example)
+                         record_spikes=record_spikes, embodiment=emb,
+                         example=example, trace_level=trace_level)
     init_state = torch.tensor(spec.init_state, dtype=torch.float32)
 
     env = None
@@ -285,6 +303,17 @@ def _run_one(controller: str, *, steps: int, radius: float, freq: float, seed: i
     if payload is not None:
         out["spikes"] = payload
     out["env"] = emb.to_dict() if emb.enable else None
+    # base estimator traces (consistent with _run_many)
+    for key in ("estimates", "measurements", "fix_events", "estimator"):
+        if result.get(key) is not None:
+            out[key] = result[key]
+    # extended telemetry: only for the opt-in full trace level
+    if trace_level == "full":
+        for key in ("applied", "disturbances", "impulse_frames",
+                    "measurements_by_channel", "innovations",
+                    "covariance_diag", "success"):
+            if result.get(key) is not None:
+                out[key] = result[key]
     return out
 
 
@@ -292,7 +321,7 @@ def _run_many(controllers: Sequence[str], *, steps: int, radius: float, freq: fl
               seed: int, record_spikes: bool, spike_format: str,
               include_trace: bool, profile: str = "clean",
               embodiment: Optional[EmbodimentConfig] = None,
-              example: str = "ball") -> dict:
+              example: str = "ball", trace_level: str = "short") -> dict:
     """Run several controllers on one shared reference trajectory."""
     svc = RUNTIME.service(seed, profile, embodiment, example)
     engine = svc.engine
@@ -302,7 +331,8 @@ def _run_many(controllers: Sequence[str], *, steps: int, radius: float, freq: fl
     reference = engine.reference(steps=steps, radius=radius, freq=freq)
     emb = embodiment or EmbodimentConfig()
     bc = BenchmarkConfig(steps=steps, radius=radius, freq=freq,
-                         record_spikes=record_spikes, embodiment=emb, example=example)
+                         record_spikes=record_spikes, embodiment=emb,
+                         example=example, trace_level=trace_level)
     init_state = torch.tensor(spec.init_state, dtype=torch.float32)
 
     built = {n: engine.build_controller(n) for n in names}
@@ -514,13 +544,12 @@ def create_app(config: Optional[Dict[str, Any]] = None) -> Flask:
             body = _body()
             steps = _as_int(body.get("steps"), "steps", DEFAULT_STEPS, 1, MAX_STEPS)
             seed = _as_int(body.get("seed"), "seed", RUNTIME.default_seed, SEED_MIN, SEED_MAX)
-            radius = _as_float(body.get("radius"), "radius", 0.15, 0.0, 1.0)
-            freq = _as_float(body.get("freq"), "freq", 0.5, 0.0, 10.0)
+            example, radius, freq = _example_geometry(body)
             record_spikes = _as_bool(body.get("record_spikes"), "record_spikes", True)
             spike_format = _as_spike_format(body)
+            trace_level = _as_trace_level(body)
             profile = _profile_from_body(body)
             embodiment = _env_from_body(body)
-            example = _example_from_body(body) or RUNTIME.default_example
 
             t0 = time.time()
             if "controllers" in body:
@@ -534,6 +563,7 @@ def create_app(config: Optional[Dict[str, Any]] = None) -> Flask:
                     record_spikes=record_spikes, spike_format=spike_format,
                     include_trace=_as_bool(body.get("include_trace"), "include_trace", True),
                     profile=profile, embodiment=embodiment, example=example,
+                    trace_level=trace_level,
                 )
             else:
                 requested = body.get("controller", "pid")
@@ -541,6 +571,7 @@ def create_app(config: Optional[Dict[str, Any]] = None) -> Flask:
                     requested, steps=steps, radius=radius, freq=freq, seed=seed,
                     record_spikes=record_spikes, spike_format=spike_format,
                     profile=profile, embodiment=embodiment, example=example,
+                    trace_level=trace_level,
                 )
                 out["requested_controller"] = requested
                 out["engine_name"] = out["controller"]
@@ -565,19 +596,19 @@ def create_app(config: Optional[Dict[str, Any]] = None) -> Flask:
                 raise BadRequest("'controllers' must be a non-empty list")
             steps = _as_int(body.get("steps"), "steps", DEFAULT_STEPS, 1, MAX_STEPS)
             seed = _as_int(body.get("seed"), "seed", RUNTIME.default_seed, SEED_MIN, SEED_MAX)
-            radius = _as_float(body.get("radius"), "radius", 0.15, 0.0, 1.0)
-            freq = _as_float(body.get("freq"), "freq", 0.5, 0.0, 10.0)
+            example, radius, freq = _example_geometry(body)
             record_spikes = _as_bool(body.get("record_spikes"), "record_spikes", True)
             spike_format = _as_spike_format(body)
+            trace_level = _as_trace_level(body)
             profile = _profile_from_body(body)
             embodiment = _env_from_body(body)
-            example = _example_from_body(body) or RUNTIME.default_example
             t0 = time.time()
             out = _run_many(
                 list(requested), steps=steps, radius=radius, freq=freq, seed=seed,
                 record_spikes=record_spikes, spike_format=spike_format,
                 include_trace=_as_bool(body.get("include_trace"), "include_trace", True),
                 profile=profile, embodiment=embodiment, example=example,
+                trace_level=trace_level,
             )
             out["elapsed_ms"] = round((time.time() - t0) * 1000.0, 3)
             return jsonify(out)
@@ -603,10 +634,8 @@ def create_app(config: Optional[Dict[str, Any]] = None) -> Flask:
                 raise BadRequest("a sweep supports at most 5 controllers")
             steps = _as_int(body.get("steps"), "steps", DEFAULT_STEPS, 1, MAX_STEPS)
             seed = _as_int(body.get("seed"), "seed", RUNTIME.default_seed, SEED_MIN, SEED_MAX)
-            radius = _as_float(body.get("radius"), "radius", 0.15, 0.0, 1.0)
-            freq = _as_float(body.get("freq"), "freq", 0.5, 0.0, 10.0)
             profile = _profile_from_body(body)
-            example = _example_from_body(body) or RUNTIME.default_example
+            example, radius, freq = _example_geometry(body)
             points = body.get("points")
             if points is not None and (not isinstance(points, (list, tuple)) or len(points) > MAX_POINTS):
                 raise BadRequest(f"'points' must be a list of at most {MAX_POINTS} items")
@@ -663,10 +692,8 @@ def create_app(config: Optional[Dict[str, Any]] = None) -> Flask:
             body = _body()
             steps = _as_int(body.get("steps"), "steps", DEFAULT_STEPS, 1, EXPORT_MAX_STEPS)
             seed = _as_int(body.get("seed"), "seed", RUNTIME.default_seed, SEED_MIN, SEED_MAX)
-            radius = _as_float(body.get("radius"), "radius", 0.15, 0.0, 1.0)
-            freq = _as_float(body.get("freq"), "freq", 0.5, 0.0, 10.0)
+            example, radius, freq = _example_geometry(body)
             requested = body.get("controller", "pid")
-            example = _example_from_body(body) or RUNTIME.default_example
             if example != "ball":
                 raise BadRequest(
                     f"MP4 export currently supports the 'ball' example only (got {example!r})"
@@ -815,6 +842,22 @@ def create_app(config: Optional[Dict[str, Any]] = None) -> Flask:
             web_root=WEB_ROOT,
             hint="build them with `cd web && npm ci && npm run build`",
             api="GET /api/controllers, POST /api/simulate, POST /api/benchmark",
+        ), 404
+
+    @app.get("/extended")
+    def dashboard_extended():
+        """The extended (full-information) view.
+
+        An explicit route so the un-suffixed URL works: the catch-all below would
+        otherwise fall back to ``index.html`` for an unknown path.
+        """
+        extended = os.path.join(WEB_ROOT, "extended.html")
+        if os.path.isfile(extended):
+            return send_from_directory(WEB_ROOT, "extended.html")
+        return jsonify(
+            error="extended dashboard not found",
+            web_root=WEB_ROOT,
+            hint="build it with `cd web && npm ci && npm run build`",
         ), 404
 
     @app.get("/<path:filename>")

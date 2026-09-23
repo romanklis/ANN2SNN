@@ -14,6 +14,7 @@ const COLORS = {
   axis: "#b9c4d1",
   orbit: "#aeb9c6",
   ref: "#e4572e",
+  fix: "#b48cff",
   text: "#cfe0f7",
   muted: "#93a1b8",
   off: "#ff4d4d",
@@ -50,6 +51,7 @@ export class Stage {
     this.renderer = "plate";     // "plate" (ball) | "quad" (drone)
     this.successLabel = "ON PLATE";
     this.boundsHigh = [0.25, 0.25];
+    this.fixes = [];             // checkpoint-fix moments (quad stage)
 
     this.frame = 0;
     this.playing = false;
@@ -73,7 +75,8 @@ export class Stage {
 
   // ------------------------------------------------------------------ data
   setScene({ reference, series = [], plateHalf = 0.25, measurements = null,
-             renderer = "plate", successLabel = "ON PLATE", boundsHigh = null }) {
+             renderer = "plate", successLabel = "ON PLATE", boundsHigh = null,
+             fixes = [] }) {
     this.reference = reference || null;
     this.series = series.filter((s) => s.trajectory && s.trajectory.length);
     this.measurements = measurements && measurements.length ? measurements : null;
@@ -81,6 +84,7 @@ export class Stage {
     this.renderer = renderer || "plate";
     this.successLabel = successLabel || "ON PLATE";
     this.boundsHigh = boundsHigh || [this.plateHalf, this.plateHalf];
+    this.fixes = (fixes || []).filter(Boolean);
     this.frame = 0;
     this._lastTs = 0;
     this.draw();
@@ -571,6 +575,23 @@ export class Stage {
       ctx.setLineDash([]);
     }
 
+    // ---- checkpoint fixes ------------------------------------------------- #
+    // Moments where a beacon was in range: the estimator got an absolute fix.
+    for (const f of this.fixes) {
+      const q = P(clip(f[0], bx), clip(f[1], by), Math.max(0, clip(f[2] ?? 0, bz)));
+      ctx.strokeStyle = COLORS.fix;
+      ctx.lineWidth = 1.6;
+      ctx.globalAlpha = 0.9;
+      ctx.beginPath();
+      ctx.arc(q.x, q.y, 5.5, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(q.x - 8, q.y); ctx.lineTo(q.x + 8, q.y);
+      ctx.moveTo(q.x, q.y - 8); ctx.lineTo(q.x, q.y + 8);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+
     // ---- bodies ---------------------------------------------------------- #
     for (const s of this.series) {
       if (k >= s.trajectory.length) continue;
@@ -596,6 +617,30 @@ export class Stage {
       ctx.lineTo(p.x, p.y);
       ctx.stroke();
       ctx.setLineDash([]);
+
+      // the controller's belief: the drift between checkpoint fixes is visible
+      // as the gap between the true body and this ghost marker
+      const est = s.estimates ? s.estimates[k] : null;
+      if (est) {
+        const pe = P(
+          clip(est[0], bx), clip(est[1], by),
+          Math.max(0, clip(est[2] ?? 0, bz))
+        );
+        ctx.strokeStyle = "rgba(180,140,255,0.75)";
+        ctx.lineWidth = 1;
+        ctx.setLineDash([2, 3]);
+        ctx.beginPath();
+        ctx.moveTo(p.x, p.y);
+        ctx.lineTo(pe.x, pe.y);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.strokeStyle = COLORS.fix;
+        ctx.globalAlpha = 0.85;
+        ctx.beginPath();
+        ctx.arc(pe.x, pe.y, Math.max(2.5, r * 0.5), 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.globalAlpha = 1;
+      }
 
       this._sphere(p.x, p.y, r, color);
 

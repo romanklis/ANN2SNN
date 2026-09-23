@@ -22,6 +22,7 @@ from .physics import (
 __all__ = [
     "DEFAULT_STEPS",
     "DEFAULT_EXAMPLE",
+    "TRACE_LEVELS",
     "PlantConfig",
     "NetworkConfig",
     "EmbodimentConfig",
@@ -36,6 +37,10 @@ DEFAULT_STEPS: int = 500
 #: Which example to simulate by default ("ball" | "drone").  Kept as a literal so
 #: this module never imports :mod:`sim_engine.examples` (which imports it).
 DEFAULT_EXAMPLE: str = "ball"
+
+#: Trace verbosity.  ``short`` is the wire payload the hero dashboard uses;
+#: ``full`` adds estimator internals + per-frame environment telemetry.
+TRACE_LEVELS: Tuple[str, ...] = ("short", "full")
 
 
 def _default_init_state() -> Tuple[float, float, float, float]:
@@ -90,6 +95,10 @@ class EmbodimentConfig:
     # -- sensing ------------------------------------------------------------ #
     sensor_noise_pos: float = 0.0     # Gaussian sigma on measured position [m]
     sensor_delay: int = 0             # observation delay [control frames]
+    #: Multiplies every *non-legacy* sensor channel's nominal noise (the
+    #: multi-channel examples).  The historical position camera keeps taking its
+    #: noise from ``sensor_noise_pos``, so the ball's numbers are unchanged.
+    sensor_noise_scale: float = 1.0
 
     # -- estimator (always a Kalman filter; the controller never sees x) ---- #
     estimator: str = "kalman"
@@ -127,6 +136,7 @@ class EmbodimentConfig:
         return (
             self.sensor_noise_pos == 0.0
             and self.sensor_delay == 0
+            and self.sensor_noise_scale == 1.0
             and self.actuator_delay == 0
             and self.actuator_gain == 1.0
             and self.actuator_bias == 0.0
@@ -156,12 +166,13 @@ class EmbodimentConfig:
 #: is the default story setting (mild noise + delay + impulses + a lossy body).
 EMBODIMENT_PRESETS: Dict[str, dict] = {
     "clean": {},
-    "noisy": {"sensor_noise_pos": 0.005},
+    "noisy": {"sensor_noise_pos": 0.005, "sensor_noise_scale": 3.0},
     "delayed": {"sensor_delay": 3, "actuator_delay": 2},
     "perturbed": {"impulse_interval": 60, "impulse_std": 0.15},
     "heavy": {"damping": 0.6, "c_scale": 0.8},
     "embodied": {
         "sensor_noise_pos": 0.004,
+        "sensor_noise_scale": 2.0,
         "sensor_delay": 2,
         "actuator_delay": 1,
         "impulse_interval": 80,
@@ -183,6 +194,16 @@ class BenchmarkConfig:
     record_spikes: bool = True
     example: str = DEFAULT_EXAMPLE
     embodiment: EmbodimentConfig = field(default_factory=EmbodimentConfig)
+    #: "short" = the wire payload the hero dashboard uses; "full" additionally
+    #: returns the estimator internals and per-frame environment telemetry used by
+    #: the extended dashboard (see ``TrajectoryResult``).
+    trace_level: str = "short"
+
+    def __post_init__(self) -> None:
+        if self.trace_level not in TRACE_LEVELS:
+            raise ValueError(
+                f"trace_level must be one of {list(TRACE_LEVELS)}, got {self.trace_level!r}"
+            )
 
     def to_dict(self) -> dict:
         return dataclasses.asdict(self)
@@ -269,6 +290,7 @@ class EngineConfig:
     embodiment_preset: Optional[str] = None
     sensor_noise_pos: Optional[float] = None
     sensor_delay: Optional[int] = None
+    sensor_noise_scale: Optional[float] = None
     actuator_delay: Optional[int] = None
     disturbance_std: Optional[float] = None   # -> process_noise
     damping: Optional[float] = None
@@ -314,7 +336,7 @@ class EngineConfig:
             t.lr = float(self.lr)
 
         # Embodiment: an explicit config wins, otherwise a preset + flat fields.
-        flat = (self.sensor_noise_pos, self.sensor_delay,
+        flat = (self.sensor_noise_pos, self.sensor_delay, self.sensor_noise_scale,
                 self.actuator_delay, self.disturbance_std, self.damping, self.c_scale)
         if self.embodiment is not None:
             b.embodiment = self.embodiment
@@ -324,6 +346,8 @@ class EngineConfig:
                 cfg.sensor_noise_pos = float(self.sensor_noise_pos)
             if self.sensor_delay is not None:
                 cfg.sensor_delay = int(self.sensor_delay)
+            if self.sensor_noise_scale is not None:
+                cfg.sensor_noise_scale = float(self.sensor_noise_scale)
             if self.actuator_delay is not None:
                 cfg.actuator_delay = int(self.actuator_delay)
             if self.disturbance_std is not None:

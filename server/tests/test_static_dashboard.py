@@ -20,6 +20,7 @@ from server import app as app_module
 
 STATIC_DIR = Path(app_module.WEB_ROOT)
 INDEX = STATIC_DIR / "index.html"
+EXTENDED = STATIC_DIR / "extended.html"
 
 
 def _require_bundle() -> Path:
@@ -37,6 +38,14 @@ def client():
 @pytest.fixture(scope="module")
 def built_index() -> Path:
     return _require_bundle()
+
+
+@pytest.fixture(scope="module")
+def built_extended() -> Path:
+    _require_bundle()
+    if not EXTENDED.is_file():
+        pytest.skip(f"extended dashboard not built at {EXTENDED}")
+    return EXTENDED
 
 
 # --------------------------------------------------------------------------- #
@@ -81,6 +90,55 @@ def test_single_screen_layout(built_index: Path):
     assert css_refs, "expected a bundled stylesheet"
     css = (STATIC_DIR / "assets" / css_refs[0]).read_text(errors="ignore")
     assert "overflow:hidden" in css.replace(" ", "")
+
+
+# --------------------------------------------------------------------------- #
+# extended view (full-information inspector)
+# --------------------------------------------------------------------------- #
+def test_extended_page_is_built_with_its_assets(built_extended: Path):
+    html = built_extended.read_text()
+    refs = re.findall(r'(?:src|href)="\.?/?assets/([^"]+)"', html)
+    assert refs, "extended.html should reference bundled assets"
+    for ref in refs:
+        assert (STATIC_DIR / "assets" / ref).is_file(), f"missing asset {ref}"
+
+
+def test_extended_page_has_its_sections(built_extended: Path):
+    html = built_extended.read_text()
+    for required in ("stage", "spikes", "scrub", "all-toggle", "readout",
+                     "table-metrics", "table-estimator", "table-env",
+                     "table-config", "table-robust", "table-spikes",
+                     "example-select", "env-select", "seed-input", "steps-input",
+                     "controller-picker", "export-json-btn", "play-btn",
+                     "step-back-btn", "step-fwd-btn", "success-pill",
+                     "lane-pos", "lane-vel", "lane-track", "lane-est",
+                     "lane-cmd", "lane-dist", "lane-innov", "lane-cov"):
+        assert f'id="{required}"' in html, f"missing #{required}"
+    # the page only makes sense if it can scroll (the hero screen cannot)
+    assert 'class="extended"' in html
+
+
+def test_extended_page_scrolls(built_extended: Path):
+    """The hero pins `body { overflow: hidden }`; the extended page must undo it."""
+    html = built_extended.read_text()
+    css_refs = re.findall(r'href="\.?/?assets/([^"]+\.css)"', html)
+    assert css_refs, "expected a bundled stylesheet"
+    css = (STATIC_DIR / "assets" / css_refs[0]).read_text(errors="ignore")
+    flat = css.replace(" ", "").replace("\n", "")
+    assert "body.extended{" in flat and "overflow:auto" in flat
+
+
+def test_extended_route_serves_the_page(client, built_extended: Path):
+    for path in ("/extended", "/extended.html"):
+        r = client.get(path)
+        assert r.status_code == 200, path
+        assert r.headers["Content-Type"].startswith("text/html")
+        assert b"EXTENDED" in r.data
+
+
+def test_hero_links_to_the_extended_view(built_index: Path):
+    assert 'id="extended-link"' in built_index.read_text()
+    assert "extended.html" in built_index.read_text()
 
 
 # --------------------------------------------------------------------------- #

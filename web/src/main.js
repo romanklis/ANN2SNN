@@ -31,6 +31,8 @@ const el = {
   exampleSelect: $("example-select"),
   envSelect: $("env-select"),
   pipePlant: $("pipe-plant"),
+  pipeSensors: $("pipe-sensors"),
+  legendFix: $("legend-fix"),
   pipeKalman: $("pipe-kalman"),
   controlTitle: $("control-title"),
   trackingTitle: $("tracking-title"),
@@ -54,6 +56,7 @@ const el = {
   resultSnn: $("result-snn"),
   resultDelta: $("result-delta"),
   resultNote: $("result-note"),
+  extendedLink: $("extended-link"),
 };
 
 const stage = new Stage(el.stage);
@@ -75,6 +78,8 @@ const state = {
   envSpecs: {},
   example: "ball",
   examples: {},
+  fixFrames: new Set(),
+  fixRow: null,
 };
 
 function exampleSpec() {
@@ -131,6 +136,18 @@ function updateClock(k) {
   const dt = state.reference?.dt ?? 0.02;
   el.clock.textContent = `t = ${(k * dt).toFixed(2)} s`;
 }
+// Deep-link the extended view with the current selection so the two pages agree.
+function updateExtendedLink() {
+  if (!el.extendedLink) return;
+  const q = new URLSearchParams({
+    example: state.example,
+    env: state.envPreset,
+    seed: String(BENCH.seed),
+    steps: String(BENCH.steps),
+    controllers: `${ANN},${SNN}`,
+  });
+  el.extendedLink.href = `./extended.html?${q.toString()}`;
+}
 
 // -------------------------------------------------------------------- example
 // The example (plant + task + estimator model + metric + labels/units) is a
@@ -174,6 +191,57 @@ function applyExampleLabels() {
     el.trackingTitle.innerHTML =
       `Tracking · ${String(labels.error || "error").toLowerCase()} ` +
       `<span class="unit">[${units.error || ""}]</span>`;
+  }
+  renderSensors(spec);
+}
+
+// One pipeline row per sensor channel, straight from the example catalogue.
+function renderSensors(spec) {
+  const host = el.pipeSensors;
+  if (!host) return;
+  const channels = (spec.sensor && spec.sensor.channels) || [];
+  const d = spec.pos_dim || 2;
+  const pos = ["x", "y", "z"].slice(0, d);
+  const nameOf = (a) => pos.concat(pos.map((p) => `v${p}`))[a] ?? `s${a}`;
+
+  host.innerHTML = channels
+    .map((ch) => {
+      const names = ch.axes.map(nameOf).join(", ");
+      let label = ch.kind.toUpperCase();
+      let value = names;
+      let sub = "";
+      if (ch.noise_from_config) {
+        label = "CAMERA";
+        value = `y = [${names}] + v`;
+        sub = "position-only · noisy · delayed";
+      } else if (ch.kind === "imu") {
+        label = "IMU";
+        value = "a = u_eff + d";
+        sub = `prediction input · σ ${ch.base_noise} m/s²`;
+      } else if (ch.kind === "altitude") {
+        label = "BARO";
+        sub = `σ ${ch.base_noise} m · ${ch.latency} frame(s)`;
+      } else if (ch.kind === "flow_velocity") {
+        label = "FLOW";
+        sub = `σ ${ch.base_noise} m/s · ${ch.latency} frame(s)`;
+      } else if (ch.kind === "position_fix") {
+        label = "FIX";
+        value = "p − c (nearest anchor)";
+        sub = `σ ${ch.base_noise} m · ${ch.latency} frame(s) · gate ${ch.gate_range} m`;
+      }
+      const isFix = ch.kind === "position_fix" && ch.gated;
+      return (
+        `<div class="pipe-row on${isFix ? " row-fix" : ""}"${isFix ? ' data-row="fix"' : ""}>` +
+        `<span class="pr-rule"></span>` +
+        `<span class="pr-label">${escapeHtml(label)}</span>` +
+        `<span class="pr-value">${escapeHtml(value)}` +
+        `<span class="pr-sub">${escapeHtml(sub)}</span></span></div>`
+      );
+    })
+    .join("");
+  state.fixRow = host.querySelector('[data-row="fix"]');
+  if (el.legendFix) {
+    el.legendFix.classList.toggle("hidden", !state.fixRow);
   }
 }
 
@@ -271,7 +339,9 @@ async function loadOnce() {
       renderer: spec.renderer || "plate",
       successLabel: spec.labels?.success || "ON PLATE",
       boundsHigh: spec.bounds_high || null,
+      fixes: (snn.fix_events || []).map((e) => e.pos),
     });
+    state.fixFrames = new Set((snn.fix_events || []).map((e) => e.k));
     stage.setLoop(true);
 
     // spike activity (first 200 of N neurons)
@@ -325,6 +395,7 @@ async function loadOnce() {
     if (!canvasRecordingSupported()) setPill(el.capturePill, "no capture", "pill-bad");
 
     updateClock(0);
+    updateExtendedLink();
     pipeline.replay();
     stage.play();
     updatePlayIcon();
@@ -352,9 +423,16 @@ function buildResultBar(ann, snn) {
   el.resultDelta.parentElement.title = "difference (SNN − ANN)";
   const est = stats[SNN]?.estimation_pos_rmse_cm;
   const errLabel = String(exampleSpec().labels?.error || "tracking error").toLowerCase();
+  let extra = "";
+  const axes = stats[SNN]?.estimation_pos_rmse_cm_axes;
+  if (axes?.length) extra += ` · x̂ per-axis ${axes.map((v) => fmt(v, 1)).join("/")} cm`;
+  const drift = stats[SNN]?.estimation_max_pos_err_cm;
+  if (drift != null) extra += ` · max drift ${fmt(drift, 1)} cm`;
+  const firstFix = stats[SNN]?.estimation_first_fix_step;
+  if (firstFix != null) extra += ` · first fix f${firstFix}`;
   el.resultNote.textContent =
     `closed-loop ${errLabel} · Δ = SNN − ANN · ${state.example} · env ${state.envPreset} · policy ${state.profile}` +
-    (est != null ? ` · x̂ RMSE ${fmt(est)} cm` : "");
+    (est != null ? ` · x̂ RMSE ${fmt(est)} cm` : "") + extra;
 }
 
 // ---------------------------------------------------------------- capture
@@ -446,6 +524,7 @@ stage.onFrame = (k) => {
   controlChart.setFrame(k);
   trackingChart.setFrame(k);
   updateClock(k);
+  if (state.fixRow) state.fixRow.classList.toggle("active", state.fixFrames.has(k));
   if (k === 0 && state.lastFrame > 0) pipeline.replay();   // capture the reveal each loop
   state.lastFrame = k;
   updatePlayIcon();

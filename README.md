@@ -51,6 +51,7 @@ controller contract, distillation, ANN→SNN transfer, sessions and API stay sha
 |---|---|---|---|
 | **Balancing ball** (`ball`, default) | ball rolling on a tilting plate | plate tilt `[θx, θy]` rad | track a circular orbit |
 | **Hovering drone** (`drone`) | 3-D point mass | thrust `[ax, ay, az]` m/s² | lissajous flight path or hover |
+| **GPS-denied drone** (`drone_gps_denied`) | 3-D point mass | thrust `[ax, ay, az]` m/s² | same flight path, **no absolute position**: IMU + barometer + optical flow + geometry-gated checkpoint fixes |
 
 ```bash
 python -m sim_engine benchmark --example drone --steps 500
@@ -70,6 +71,18 @@ are cached per `(example, profile, seed)`. Adding a new example is one module pl
 The dashboard's **EXAMPLE** selector switches the stage between the isometric
 plate view and the 3-D corridor flight view and relabels every panel from the
 catalogue (`PLATE TILT [rad]` vs `THRUST [m/s²]`, `ON PLATE` vs `IN CORRIDOR`).
+An **EXTENDED ↗** link opens `/extended`: the same run with full telemetry — every
+state estimate per controller, the estimator internals (per-channel samples,
+innovations, covariance) and a per-frame readout — over an opt-in
+`trace_level: "full"` benchmark. See
+[`docs/DASHBOARD.md`](docs/DASHBOARD.md#extended-view-extended).
+
+Each example owns its **sensor suite**, so the estimator can be fed what the
+vehicle can actually measure. `drone_gps_denied` drops the position camera for an
+accelerometer-driven Kalman prediction plus barometer, optical flow and occasional
+checkpoint fixes; the pipeline panel lists the channels and the stage draws the
+controller's belief next to the true body. See
+[`docs/EXAMPLES.md`](docs/EXAMPLES.md#gps-denied-drone).
 
 ---
 

@@ -4,9 +4,9 @@ import { dirname, resolve } from "node:path";
 
 const here = dirname(fileURLToPath(import.meta.url));
 
-// The bundle is served by the Flask backend (server/app.py) at "/", so we emit
-// relative asset URLs ("base: './'") which work at the site root *and* under a
-// reverse-proxy prefix. Output goes to ../server/static.
+// Two pages, one bundle output. The Flask backend (server/app.py) serves "/" and
+// "/extended", so we emit relative asset URLs ("base: './'") which work at the
+// site root *and* under a reverse-proxy prefix. Output goes to ../server/static.
 export default defineConfig({
   root: here,
   base: "./",
@@ -16,5 +16,11 @@ export default defineConfig({
     target: "es2020",
     sourcemap: false,
     chunkSizeWarningLimit: 2048,
+    rollupOptions: {
+      input: {
+        main: resolve(here, "index.html"),
+        extended: resolve(here, "extended.html"),
+      },
+    },
   },
 });

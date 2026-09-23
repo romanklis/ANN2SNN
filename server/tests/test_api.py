@@ -65,7 +65,7 @@ def test_controllers_payload(client):
 def test_controllers_expose_examples(client):
     """The example catalogue ships plant/task dims, labels, bounds, renderer."""
     body = client.get("/api/controllers").get_json()
-    assert body["example_names"] == ["ball", "drone"]
+    assert body["example_names"] == ["ball", "drone", "drone_gps_denied"]
     assert body["default_example"] == "ball"
 
     examples = {e["name"]: e for e in body["examples"]}
@@ -78,6 +78,19 @@ def test_controllers_expose_examples(client):
     assert len(drone["bounds_high"]) == 3
     assert drone["bounds_high"][0] == pytest.approx(1.0)
     assert drone["defaults"]["radius"] > ball["defaults"]["radius"]
+
+    # every example declares a sensor suite the dashboard can render
+    for name, ex in examples.items():
+        assert ex["sensor"], f"{name} is missing a sensor suite"
+        assert ex["sensor"]["channels"]
+    gps = examples["drone_gps_denied"]
+    assert gps["labels"]["success"] == "IN CORRIDOR"
+    kinds = [c["kind"] for c in gps["sensor"]["channels"]]
+    assert kinds == ["imu", "altitude", "flow_velocity", "position_fix"]
+    assert gps["sensor"]["prediction_channel"] == "imu"
+    assert len(gps["sensor"]["anchors"]) == 3
+    assert gps["sensor"]["launch"] == [0.0] * 6
+    assert gps["sensor"]["measurement_dim"] == 6  # altitude 1 + flow 2 + fix 3
 
 
 def test_benchmark_accepts_drone_example(client, monkeypatch):
@@ -106,6 +119,87 @@ def test_benchmark_rejects_unknown_example(client):
     })
     assert r.status_code == 400
     assert "example" in r.get_json()["error"]
+
+
+def test_trace_level_full_adds_estimator_internals(client, monkeypatch):
+    """The extended view's opt-in telemetry is exposed over HTTP."""
+    monkeypatch.setattr(RUNTIME, "auto_train", False)
+    RUNTIME._engines.clear()
+    try:
+        r = client.post("/api/benchmark", json={
+            "example": "drone_gps_denied", "controllers": ["pid"], "steps": 120,
+            "seed": 42, "embodiment": "clean", "include_trace": True,
+            "trace_level": "full",
+        })
+        assert r.status_code == 200
+        body = r.get_json()
+        pid = body["results"]["pid"]
+        assert body["config"]["trace_level"] == "full"
+        for key in ("applied", "disturbances", "impulse_frames",
+                    "measurements_by_channel", "innovations",
+                    "covariance_diag", "success"):
+            assert key in pid, key
+        assert len(pid["applied"]) == 120
+        assert len(pid["covariance_diag"]) == 120
+        assert len(pid["covariance_diag"][0]) == 6          # 2 * pos_dim
+        assert len(pid["success"]) == 120
+        assert set(pid["measurements_by_channel"]) == {
+            "altitude", "flow_velocity", "position_fix"}
+        # gaps survive as JSON null (the checkpoint is out of range early on)
+        assert None in pid["measurements_by_channel"]["position_fix"]
+
+        # the same trace level is accepted by the single-controller endpoint
+        one = client.post("/api/simulate", json={
+            "controller": "pid", "steps": 40, "trace_level": "full",
+            "example": "drone_gps_denied",
+        })
+        assert one.status_code == 200
+        assert "applied" in one.get_json()
+    finally:
+        RUNTIME._engines.clear()
+
+
+def test_trace_level_defaults_to_short_and_is_validated(client):
+    body = client.post("/api/benchmark", json={
+        "controllers": ["pid"], "steps": 20, "include_trace": True,
+    }).get_json()
+    assert body["config"]["trace_level"] == "short"
+    assert "applied" not in body["results"]["pid"]
+
+    bad = client.post("/api/benchmark", json={
+        "controllers": ["pid"], "steps": 20, "trace_level": "deep",
+    })
+    assert bad.status_code == 400
+    assert "trace_level" in bad.get_json()["error"]
+
+
+def test_benchmark_gps_denied_example(client, monkeypatch):
+    """The multi-channel sensor example runs over HTTP and reports its fixes."""
+    monkeypatch.setattr(RUNTIME, "auto_train", False)
+    RUNTIME._engines.clear()
+    try:
+        r = client.post("/api/benchmark", json={
+            "example": "drone_gps_denied", "controllers": ["pid"], "steps": 500,
+            "seed": 42, "embodiment": "clean", "include_trace": True,
+        })
+        assert r.status_code == 200
+        body = r.get_json()
+        assert body["stats"]["example"] == "drone_gps_denied"
+        pid = body["results"]["pid"]
+        assert len(pid["trajectory"]) == 500
+        # onboard sensing: no absolute-position camera stream at all
+        assert pid.get("measurements") is None
+        assert len(pid["fix_events"]) > 0
+        metrics = pid["metrics"]
+        assert metrics["estimation_pos_rmse_cm"] > 0.0
+        assert len(metrics["estimation_pos_rmse_cm_axes"]) == 3
+        assert metrics["estimation_max_pos_err_cm"] >= metrics["estimation_pos_rmse_cm"]
+        assert metrics["estimation_first_fix_step"] is not None
+        sensor = pid["estimator"]["sensor"]
+        assert sensor["has_imu"] is True
+        assert sensor["max_latency"] == 5
+    finally:
+        RUNTIME._engines.clear()
 
 
 def test_model_guide_and_training_metadata(client):
@@ -422,6 +516,45 @@ def test_train_job_runs_and_registers_weights(client):
         RUNTIME.set_weights(before)
         if os.path.exists(WEIGHTS_PATH):
             os.remove(WEIGHTS_PATH)
+
+
+# --------------------------------------------------------------------------- #
+# weights caching guards
+# --------------------------------------------------------------------------- #
+def test_weight_override_is_keyed_by_example():
+    """A bundle pinned for one example must not be used by another.
+
+    Bundles are dimensioned by their example (6→2 ball, 9→3 drones); keying the
+    override by profile alone made a drone training job break every ball request.
+    """
+    default = RUNTIME.weights_path
+    try:
+        RUNTIME.set_weights("/tmp/drone_bundle.pt", profile="clean",
+                            example="drone_gps_denied")
+        assert RUNTIME._weights_path(42, "clean", "drone_gps_denied") == "/tmp/drone_bundle.pt"
+        assert RUNTIME._weights_path(42, "clean", "ball") == default
+        assert RUNTIME._weights_path(42, "robust", "drone_gps_denied") != "/tmp/drone_bundle.pt"
+    finally:
+        RUNTIME.set_weights(None, profile=None, example=None)
+    assert RUNTIME._weight_overrides == {}
+
+
+def test_unusable_weights_bundle_does_not_500(client, monkeypatch):
+    """A stale/mismatched cache file must degrade to an untrained engine, not fail."""
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("size mismatch for net.2.weight")
+
+    monkeypatch.setattr("sim_engine.training.load_weights", boom)
+    try:
+        RUNTIME.set_weights(RUNTIME.weights_path, profile="clean", example="ball")
+        r = client.post("/api/benchmark", json={
+            "example": "ball", "controllers": ["pid"], "steps": 20,
+            "include_trace": True,
+        })
+        assert r.status_code == 200, r.get_json()
+    finally:
+        RUNTIME.set_weights(None, profile=None, example=None)
 
 
 # --------------------------------------------------------------------------- #

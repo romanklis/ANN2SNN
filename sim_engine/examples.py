@@ -40,6 +40,14 @@ from .physics import (
     PLATE_HALF,
 )
 from .reference import Reference, lissajous_reference, orbit_reference, setpoint_reference
+from .sensors import (
+    SensorSpec,
+    altitude_channel,
+    camera_channel,
+    checkpoint_channel,
+    flow_channel,
+    imu_channel,
+)
 
 __all__ = [
     "ExampleSpec",
@@ -107,6 +115,9 @@ class ExampleSpec:
     labels: Dict[str, str]
     renderer: str
     defaults: Dict[str, Any] = field(default_factory=dict)
+    #: Onboard sensor suite.  ``None`` falls back to the historical
+    #: absolute-position camera driven by the embodiment config.
+    sensor: Optional[SensorSpec] = None
 
     # -- derived dimensions ------------------------------------------------- #
     @property
@@ -115,7 +126,15 @@ class ExampleSpec:
 
     @property
     def measurement_dim(self) -> int:
+        """Nominal measurement width (sum of the non-prediction channels)."""
+        if self.sensor is not None:
+            return self.sensor.resolve(None, self.pos_dim).measurement_dim
         return self.pos_dim
+
+    @property
+    def launch(self) -> Tuple[float, ...]:
+        """Known launch pose, if the sensor suite declares one."""
+        return self.sensor.launch if self.sensor is not None else ()
 
     @property
     def state_dim(self) -> int:
@@ -152,10 +171,14 @@ class ExampleSpec:
 
     # -- runtime factories -------------------------------------------------- #
     def make_env(self, embodiment, *, dt: float = DT, device="cpu") -> EmbodiedEnv:
+        sensor = (
+            self.sensor.resolve(embodiment, self.pos_dim)
+            if self.sensor is not None else None
+        )
         return EmbodiedEnv(
             embodiment, dt=dt, max_tilt=self.control_limit, device=device,
             init_state=self.init_state, pos_dim=self.pos_dim,
-            plant_gain=self.plant_gain, step_fn=self.step_fn,
+            plant_gain=self.plant_gain, step_fn=self.step_fn, sensor=sensor,
         )
 
     def make_plant(self, *, dt: float = DT, device="cpu",
@@ -164,6 +187,10 @@ class ExampleSpec:
         return ExamplePlant(self, dt=dt, device=device, damping=damping, c_scale=c_scale)
 
     def make_estimator(self, embodiment, *, dt: float = DT, device="cpu") -> KalmanFilter:
+        sensor = (
+            self.sensor.resolve(embodiment, self.pos_dim)
+            if self.sensor is not None else None
+        )
         return KalmanFilter(
             dt=dt,
             pos_dim=self.pos_dim,
@@ -175,6 +202,7 @@ class ExampleSpec:
             init_pos_var=embodiment.estimate_init_pos_var,
             init_vel_var=embodiment.estimate_init_vel_var,
             device=device,
+            sensor=sensor,
         )
 
     # -- reporting ---------------------------------------------------------- #
@@ -197,6 +225,10 @@ class ExampleSpec:
             "labels": dict(self.labels),
             "renderer": self.renderer,
             "defaults": dict(self.defaults),
+            "launch": [float(v) for v in self.launch],
+            "sensor": (
+                None if self.sensor is None else self.sensor.to_dict(self.pos_dim)
+            ),
         }
 
 
@@ -248,6 +280,8 @@ BALL = ExampleSpec(
             "error": "RADIAL ERROR", "success": "ON PLATE"},
     renderer="plate",
     defaults={"radius": 0.15, "freq": 0.5},
+    sensor=SensorSpec(channels=(camera_channel(2),),
+                      description="position-only camera"),
 )
 
 DRONE = ExampleSpec(
@@ -266,6 +300,55 @@ DRONE = ExampleSpec(
             "error": "TRACKING ERROR", "success": "IN CORRIDOR"},
     renderer="quad",
     defaults={"radius": 0.6, "freq": 0.25},
+    sensor=SensorSpec(channels=(camera_channel(3),),
+                      description="position-only camera"),
+)
+
+# --------------------------------------------------------------------------- #
+# GPS-denied drone: realistic onboard sensing, no absolute position available
+# --------------------------------------------------------------------------- #
+#: Ground checkpoints ("beacons") on a 0.9 m ring at three phases, off the 0.6 m
+#: lissajous circle so the drone only flies into a beacon's range a few times per
+#: episode (≈7 acquisitions over 500 frames, first around frame 80).
+_GPS_DENIED_ANCHORS = (
+    (0.6364, 0.6364, 0.0),
+    (-0.8693, 0.2329, 0.0),
+    (0.2329, -0.8693, 0.0),
+)
+
+DRONE_GPS_DENIED = ExampleSpec(
+    name="drone_gps_denied",
+    label="GPS-denied drone",
+    pos_dim=3,
+    control_limit=MAX_THRUST,
+    plant_gain=1.0,
+    init_state=(0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+    step_fn=_drone_step,
+    reference_fn=_drone_reference,
+    bounds_low=(-DRONE_HALF, -DRONE_HALF, -DRONE_HALF),
+    bounds_high=(DRONE_HALF, DRONE_HALF, DRONE_HALF),
+    units={"command": "m/s²", "error": "cm", "position": "m", "velocity": "m/s"},
+    labels={"plant": "3-D DRONE (GPS-DENIED)", "command": "THRUST",
+            "error": "TRACKING ERROR", "success": "IN CORRIDOR"},
+    renderer="quad",
+    defaults={"radius": 0.6, "freq": 0.25},
+    sensor=SensorSpec(
+        channels=(
+            # the accelerometer feeds the filter's prediction, not an update
+            imu_channel(3, base_noise=0.05, latency=0,
+                        description="IMU a = u_eff + d"),
+            altitude_channel(2, base_noise=0.02, latency=2,
+                             description="barometer z"),
+            flow_channel((3, 4), base_noise=0.03, latency=3,
+                         description="optical flow (vx, vy)"),
+            checkpoint_channel((0, 1, 2), base_noise=0.05, latency=5,
+                               gate_range=0.45,
+                               description="checkpoint fix p - c"),
+        ),
+        anchors=_GPS_DENIED_ANCHORS,
+        launch=(0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+        description="IMU + barometer + optical flow + geometry-gated checkpoint fixes",
+    ),
 )
 
 
@@ -302,3 +385,4 @@ def list_examples() -> List[dict]:
 
 register_example(BALL)
 register_example(DRONE)
+register_example(DRONE_GPS_DENIED)

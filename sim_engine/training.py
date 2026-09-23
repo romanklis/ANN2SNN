@@ -23,7 +23,7 @@ PID reference arm uses.
 from __future__ import annotations
 
 import dataclasses
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -35,7 +35,7 @@ from .controllers.base import ReferenceAccelEstimator, error_vector
 from .environment import EmbodiedEnv
 from .estimators import KalmanFilter
 from .examples import get_example
-from .physics import MAX_TILT, N_IN, SYNAPSES_PER_NEURON
+from .physics import MAX_TILT, N_IN, N_OUT, SYNAPSES_PER_NEURON
 from .reference import orbit_reference
 
 __all__ = [
@@ -317,8 +317,10 @@ def generate_closed_loop_episodes(
         inputs, labels = [], []
         with torch.no_grad():
             for k in range(steps):
-                y = env.measure(state)                    # camera: position only
-                xhat = kf.update(y, u_prev)               # Kalman estimate
+                readings = env.sense(state)               # IMU + delayed channels
+                xhat = kf.update(                         # Kalman estimate
+                    readings=readings, control=u_prev, acceleration=readings.imu,
+                )
                 err = error_vector(xhat, ref.at(k))       # e = x̂ − r
                 u_ff = ff_est.update(xhat, ref.at(k))     # KF-reconstructed feed-forward
                 inp = torch.cat([err, u_ff])              # policy input [e, u_ff]
@@ -566,12 +568,14 @@ def save_weights(
             "state_dict": dense.state_dict(),
             "n_neurons": dense.n_neurons,
             "n_in": dense.n_in,
+            "n_out": getattr(dense, "n_out", None),
         }
     if connectome is not None:
         bundle["connectome"] = {
             "state_dict": connectome.state_dict(),
             "n_neurons": connectome.n_neurons,
             "n_in": connectome.n_in,
+            "n_out": getattr(connectome, "n_out", None),
             "topology": connectome.topology.to_dict(),
             "seed": connectome.topology.seed,
             # topology *shape* parameters are needed to rebuild an identical net
@@ -586,6 +590,23 @@ def save_weights(
     return path
 
 
+def _infer_dims(state_dict: Dict[str, torch.Tensor]) -> Tuple[Optional[int], Optional[int]]:
+    """``(n_in, n_out)`` from a controller's state dict, else ``(None, None)``.
+
+    A bundle is dimensioned by its example (6→2 for the ball, 9→3 for the
+    drones), so the loader must not rely on the controller class defaults.
+    """
+    for first, last in (("net.0.weight", "net.2.weight"), ("w_in.weight", "w_out.weight")):
+        if first in state_dict and last in state_dict:
+            return int(state_dict[first].shape[1]), int(state_dict[last].shape[0])
+    keys = [k for k in state_dict if k.endswith("weight")]
+    if keys:
+        a, b = state_dict[keys[0]], state_dict[keys[-1]]
+        return (int(a.shape[1]) if a.dim() == 2 else None,
+                int(b.shape[0]) if b.dim() == 2 else None)
+    return None, None
+
+
 def load_weights(path: str, device="cpu") -> dict:
     """Load a bundle produced by :func:`save_weights` (``weights_only=False``).
 
@@ -593,6 +614,10 @@ def load_weights(path: str, device="cpu") -> dict:
     constructed controllers that already hold the saved weights.  ``training`` is
     the optional metadata saved alongside the weights (loss history, final loss
     and the :class:`TrainingConfig`), or ``None`` for older bundles.
+
+    The input/output widths are taken from the saved ``state_dict`` (falling back
+    to the stored metadata), so a bundle for any example loads correctly rather
+    than being forced into the default 6→2 policy shape.
     """
     bundle = torch.load(path, map_location=device, weights_only=False)
     fmt = bundle.get("format")
@@ -606,8 +631,12 @@ def load_weights(path: str, device="cpu") -> dict:
     out: Dict[str, object] = {"training": bundle.get("training")}
     if "dense" in bundle:
         meta = bundle["dense"]
+        n_in, n_out = _infer_dims(meta["state_dict"])
         ctrl = DenseNNController(
-            n_in=meta.get("n_in", 4), n_neurons=meta["n_neurons"], device=device
+            n_in=n_in if n_in is not None else meta.get("n_in", 4),
+            n_out=n_out if n_out is not None else meta.get("n_out", N_OUT),
+            n_neurons=meta["n_neurons"],
+            device=device,
         )
         ctrl.load_state_dict(meta["state_dict"])
         ctrl.eval()
@@ -615,8 +644,10 @@ def load_weights(path: str, device="cpu") -> dict:
     if "connectome" in bundle:
         meta = bundle["connectome"]
         seed = meta.get("seed", 42)
+        n_in, n_out = _infer_dims(meta["state_dict"])
         ctrl = ConnectomeANNController(
-            n_in=meta.get("n_in", 4),
+            n_in=n_in if n_in is not None else meta.get("n_in", 4),
+            n_out=n_out if n_out is not None else meta.get("n_out", N_OUT),
             n_neurons=meta["n_neurons"],
             synapses_per_neuron=meta.get("synapses_per_neuron", SYNAPSES_PER_NEURON),
             inhibitory_fraction=meta.get("inhibitory_fraction", 0.20),

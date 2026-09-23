@@ -46,8 +46,8 @@ class TrajectoryResult:
     """Per-controller closed-loop trace + metrics."""
 
     name: str
-    trajectory: np.ndarray            # (T, 4) plant states
-    tilts: np.ndarray                 # (T, 2) applied actuator commands
+    trajectory: np.ndarray            # (T, 2D) plant states
+    tilts: np.ndarray                 # (T, D) applied actuator commands
     tracking_error: np.ndarray        # (T,) instantaneous radial error [m]
     mean_error_cm: float
     final_error_cm: float
@@ -63,12 +63,30 @@ class TrajectoryResult:
     max_recovery_step: Optional[int] = None
     disturbance_rms: Optional[float] = None
     env: Optional[dict] = None
-    #: estimation (camera measurement -> Kalman estimate) traces + errors
-    measurements: Optional[np.ndarray] = None   # (T, 2) camera y
-    estimates: Optional[np.ndarray] = None      # (T, 4) x̂ fed to the controller
+    #: estimation (sensor samples -> Kalman estimate) traces + errors
+    measurements: Optional[np.ndarray] = None   # (T, D) absolute-position camera
+    estimates: Optional[np.ndarray] = None      # (T, 2D) x̂ fed to the controller
     estimation_pos_rmse_cm: Optional[float] = None
     estimation_vel_rmse: Optional[float] = None
+    #: per-axis position RMSE [cm], worst per-frame error [cm] and the first
+    #: checkpoint fix (multi-channel sensor suites)
+    estimation_pos_rmse_cm_axes: Optional[list] = None
+    estimation_max_pos_err_cm: Optional[float] = None
+    estimation_first_fix_step: Optional[int] = None
+    fix_events: Optional[list] = None
     estimator: Optional[dict] = None
+    #: ------------------------------------------------------------------ #
+    #: extended telemetry, populated only for ``trace_level == "full"``
+    #: (the extended dashboard's per-frame inspector)
+    #: ------------------------------------------------------------------ #
+    trace_level: str = "short"
+    applied: Optional[np.ndarray] = None            # (T, D) actuated/limited command
+    disturbances: Optional[np.ndarray] = None       # (T, D) equivalent disturbance accel
+    impulse_frames: Optional[list] = None           # velocity-kick frames
+    measurements_by_channel: Optional[dict] = None  # {kind: [ (dim,) | None ]}
+    innovations: Optional[dict] = None              # {kind: [ (dim,) | None ]}
+    covariance_diag: Optional[list] = None           # [ (2D,) | None ] posterior diag(P)
+    success: Optional[list] = None                  # (T,) in-bounds flags
 
     def to_dict(self, include_trace: bool = True) -> dict:
         d = {
@@ -94,6 +112,14 @@ class TrajectoryResult:
             d["metrics"]["estimation_pos_rmse_cm"] = self.estimation_pos_rmse_cm
         if self.estimation_vel_rmse is not None:
             d["metrics"]["estimation_vel_rmse"] = self.estimation_vel_rmse
+        if self.estimation_pos_rmse_cm_axes is not None:
+            d["metrics"]["estimation_pos_rmse_cm_axes"] = list(self.estimation_pos_rmse_cm_axes)
+        if self.estimation_max_pos_err_cm is not None:
+            d["metrics"]["estimation_max_pos_err_cm"] = self.estimation_max_pos_err_cm
+        if self.estimation_first_fix_step is not None:
+            d["metrics"]["estimation_first_fix_step"] = self.estimation_first_fix_step
+        if self.fix_events is not None:
+            d["fix_events"] = list(self.fix_events)
         if self.recovery_steps is not None:
             d["recovery_steps"] = list(self.recovery_steps)
         if self.env is not None:
@@ -108,6 +134,25 @@ class TrajectoryResult:
                 d["measurements"] = self.measurements.tolist()
             if self.estimates is not None:
                 d["estimates"] = self.estimates.tolist()
+            if self.trace_level == "full":
+                # extended telemetry: per-frame estimator internals + environment
+                # side-channels.  ``None`` entries mark frames without a sample
+                # (e.g. a checkpoint that was not in range); `to_jsonable` turns
+                # them into JSON null.
+                if self.applied is not None:
+                    d["applied"] = self.applied.tolist()
+                if self.disturbances is not None:
+                    d["disturbances"] = self.disturbances.tolist()
+                if self.impulse_frames is not None:
+                    d["impulse_frames"] = list(self.impulse_frames)
+                if self.measurements_by_channel is not None:
+                    d["measurements_by_channel"] = dict(self.measurements_by_channel)
+                if self.innovations is not None:
+                    d["innovations"] = dict(self.innovations)
+                if self.covariance_diag is not None:
+                    d["covariance_diag"] = list(self.covariance_diag)
+                if self.success is not None:
+                    d["success"] = [bool(v) for v in self.success]
         if self.spikes is not None:
             d["spikes"] = self.spikes.tolist()
         return to_jsonable(d)
@@ -202,17 +247,9 @@ def run_closed_loop(
     kf: Optional[KalmanFilter] = None
     if use_env:
         env.reset()
-        kf = estimator or KalmanFilter(
-            dt=reference.dt,
-            pos_dim=env.pos_dim,
-            gain=env.plant_gain,
-            control_limit=env.control_limit,
-            process_noise=env.config.estimate_process_noise,
-            meas_noise=max(float(env.config.sensor_noise_pos), 1e-4),
-            delay=env.sensor_delay,
-            init_pos_var=env.config.estimate_init_pos_var,
-            init_vel_var=env.config.estimate_init_vel_var,
-        )
+        # The example owns the sensor model, so the estimator must be built from
+        # the spec (not inline) or a multi-channel suite would be ignored.
+        kf = estimator or spec.make_estimator(env.config, dt=reference.dt, device=device)
         kf.reset()
 
     controller.reset()
@@ -224,17 +261,46 @@ def run_closed_loop(
     impulse_frames: List[int] = []
     measurements: List[np.ndarray] = []
     estimates: List[np.ndarray] = []
+    fix_events: List[dict] = []
     wants_spikes = bool(record_spikes and getattr(controller, "spiking", False))
     u_prev = torch.zeros(spec.control_dim, dtype=state.dtype, device=device)
+    cam_kind = None
+    if use_env and env.sensor.camera_channel is not None:
+        cam_kind = env.sensor.camera_channel.kind
+
+    # ---- extended telemetry (trace_level == "full") ------------------------ #
+    full = str(getattr(config, "trace_level", "short")) == "full"
+    channel_kinds = [ch.kind for ch in env.sensor.channels] if use_env else []
+    applied: List[np.ndarray] = []
+    channel_frames: List[dict] = []       # kind -> (dim,) sample, per frame
 
     with torch.no_grad():
         for k in range(steps):
             traj.append(state.detach().cpu().numpy().copy())
             ref_k = reference.at(k)
             if use_env:
-                y = env.measure(state)                 # camera: position only
-                xhat = kf.update(y, u_prev)            # KF: full-state estimate
-                measurements.append(y.detach().cpu().numpy().copy())
+                readings = env.sense(state)            # IMU + delayed channels
+                xhat = kf.update(                      # KF: full-state estimate
+                    readings=readings, control=u_prev, acceleration=readings.imu,
+                )
+                if cam_kind is not None and cam_kind in readings.channels:
+                    measurements.append(
+                        readings.channels[cam_kind].detach().cpu().numpy().copy()
+                    )
+                if full:
+                    channel_frames.append({
+                        kind: val.detach().cpu().numpy().copy()
+                        for kind, val in readings.channels.items()
+                    })
+                if env.last_fix_new:
+                    fix_events.append({
+                        "k": int(k),
+                        "pos": state[:spec.pos_dim].detach().cpu().numpy().tolist(),
+                        "anchor": (
+                            None if env.last_fix_anchor is None
+                            else env.last_fix_anchor.detach().cpu().numpy().tolist()
+                        ),
+                    })
                 estimates.append(xhat.detach().cpu().numpy().copy())
                 u = controller.act(xhat, ref_k)        # policy acts on r − x̂
             else:
@@ -246,11 +312,16 @@ def run_closed_loop(
                     spikes.append(spk.detach().cpu().numpy().copy())
             if use_env:
                 u_eff = env.actuate(u)
+                if full:
+                    applied.append(u_eff.detach().cpu().numpy().copy())
                 state = env.step(state, u_eff, k)
                 disturbances.append(env.last_disturbance.detach().cpu().numpy().copy())
                 if env.last_impulse:
                     impulse_frames.append(k)
             else:
+                if full:
+                    # no body model: the commanded control is what the plant sees
+                    applied.append(u.detach().cpu().numpy().copy())
                 state = spec.step_fn(
                     state, u, dt=reference.dt, limit=spec.control_limit,
                     gain=spec.plant_gain, damping=0.0, disturbance=None,
@@ -273,9 +344,10 @@ def run_closed_loop(
 
     on_plate_pct = impulse_count = recovery = max_recovery = drms = env_meta = None
     est_pos_rmse = est_vel_rmse = None
+    est_axes = est_max = first_fix = None
+    inside = spec.in_bounds(trajectory)
     if use_env:
         d = spec.pos_dim
-        inside = spec.in_bounds(trajectory)
         on_plate_pct = float(100.0 * np.mean(inside)) if len(inside) else 0.0
 
         recovery = []
@@ -293,6 +365,8 @@ def run_closed_loop(
             da = np.asarray(disturbances)
             drms = float(np.sqrt(np.mean(np.sum(da ** 2, axis=1))))
         env_meta = env.describe()
+        if fix_events:
+            first_fix = int(fix_events[0]["k"])
 
         # estimation error: x̂ (what the controller saw) vs the true state
         if estimates:
@@ -302,6 +376,15 @@ def run_closed_loop(
             vel_err = np.linalg.norm(ea[:T, d:2 * d] - trajectory[:T, d:2 * d], axis=1)
             est_pos_rmse = float(np.sqrt(np.mean(pos_err ** 2)))
             est_vel_rmse = float(np.sqrt(np.mean(vel_err ** 2)))
+            est_axes = [
+                float(np.sqrt(np.mean((ea[:T, i] - trajectory[:T, i]) ** 2))) * 100.0
+                for i in range(d)
+            ]
+            est_max = float(np.max(pos_err))
+            if fix_events and first_fix is not None and first_fix < len(pos_err):
+                # drift *after* the first checkpoint: the pre-fix transient is the
+                # launch-pad initialisation, not a localisation failure.
+                est_max = float(np.max(pos_err[first_fix:]))
 
     return TrajectoryResult(
         name=name or controller.name,
@@ -325,7 +408,44 @@ def run_closed_loop(
         estimates=np.asarray(estimates) if estimates else None,
         estimation_pos_rmse_cm=est_pos_rmse,
         estimation_vel_rmse=est_vel_rmse,
+        estimation_pos_rmse_cm_axes=est_axes,
+        estimation_max_pos_err_cm=est_max,
+        estimation_first_fix_step=first_fix,
+        fix_events=fix_events or None,
         estimator=kf.describe() if kf is not None else None,
+        trace_level=str(getattr(config, "trace_level", "short")),
+        applied=np.asarray(applied) if applied else None,
+        disturbances=np.asarray(disturbances) if (full and disturbances) else None,
+        impulse_frames=list(impulse_frames) if full else None,
+        measurements_by_channel=(
+            {kind: [frame.get(kind) for frame in channel_frames] for kind in channel_kinds}
+            if full and channel_kinds else None
+        ),
+        innovations=(
+            # index == control frame, and a sample only becomes available at
+            # ``index + latency``, so read the filter's map once the run is done.
+            {
+                kind: [
+                    None if kf.innovation(i, kind) is None
+                    else kf.innovation(i, kind).detach().cpu().numpy().copy()
+                    for i in range(len(trajectory))
+                ]
+                for kind in channel_kinds
+            }
+            if full and channel_kinds and kf is not None else None
+        ),
+        covariance_diag=(
+            # like the innovations: read the filter's map once the run is done, so
+            # an index corrected only when a delayed sample arrived shows its
+            # final posterior rather than the stale pre-correction snapshot.
+            [
+                None if kf.covariance_diag(i) is None
+                else kf.covariance_diag(i).detach().cpu().numpy().copy()
+                for i in range(len(trajectory))
+            ]
+            if full and kf is not None else None
+        ),
+        success=[bool(v) for v in inside] if full else None,
     )
 
 

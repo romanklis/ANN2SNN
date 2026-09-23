@@ -70,6 +70,19 @@ def _body() -> Dict[str, Any]:
     return data
 
 
+def _as_trace_level(body: Dict[str, Any]) -> str:
+    """Trace verbosity for a benchmark/simulate request (``short`` | ``full``)."""
+    from sim_engine.config import TRACE_LEVELS
+
+    raw = body.get("trace_level")
+    if raw is None:
+        return "short"
+    level = str(raw).strip().lower()
+    if level not in TRACE_LEVELS:
+        raise BadRequest(f"'trace_level' must be one of: {list(TRACE_LEVELS)}")
+    return level
+
+
 def _spike_payload(spikes: Any, fmt: str) -> Optional[Dict[str, Any]]:
     """Convert a raw ``(T, N)`` spike matrix into the requested wire format."""
     if spikes is None or fmt == "none":
@@ -107,6 +120,7 @@ def _validate_embodiment(cfg: EmbodimentConfig) -> None:
     """Bound environmental difficulty so a request cannot be pathological."""
     checks = [
         ("sensor_noise_pos", cfg.sensor_noise_pos, 0.0, 0.05),
+        ("sensor_noise_scale", cfg.sensor_noise_scale, 0.0, 20.0),
         ("sensor_delay", cfg.sensor_delay, 0, 20),
         ("actuator_delay", cfg.actuator_delay, 0, 20),
         ("actuator_gain", cfg.actuator_gain, 0.1, 3.0),

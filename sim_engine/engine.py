@@ -16,6 +16,7 @@ to a web framework by the ``build-backend-api`` step.
 from __future__ import annotations
 
 import dataclasses
+import logging
 import threading
 import uuid
 from typing import Dict, List, Optional, Sequence
@@ -25,6 +26,8 @@ import torch
 
 from . import training as training_mod
 from .benchmark import BenchmarkReport, TrajectoryResult, evaluate, run_closed_loop
+
+log = logging.getLogger("sim_engine.engine")
 from .config import (
     BenchmarkConfig,
     EngineConfig,
@@ -71,11 +74,22 @@ class Engine:
         loaded_training = None
 
         if self.config.weights_path:
-            loaded = training_mod.load_weights(self.config.weights_path, device=self.device)
-            dense = loaded.get("dense")
-            connectome = loaded.get("connectome")
-            loaded_training = loaded.get("training")
-            trained = dense is not None and connectome is not None
+            try:
+                loaded = training_mod.load_weights(self.config.weights_path, device=self.device)
+            except Exception as exc:  # noqa: BLE001
+                # A stale or mismatched bundle (e.g. cached for another example,
+                # whose input/output dims differ) must never take a request down:
+                # warn and fall back to an untrained engine.
+                log.warning(
+                    "ignoring unusable weights bundle %s for example %r (%s: %s)",
+                    self.config.weights_path, self.config.benchmark.example,
+                    type(exc).__name__, exc,
+                )
+            else:
+                dense = loaded.get("dense")
+                connectome = loaded.get("connectome")
+                loaded_training = loaded.get("training")
+                trained = dense is not None and connectome is not None
 
         do_train = self.config.train_on_init if train is None else train
         if do_train:
@@ -325,8 +339,11 @@ class SimulationSession:
         state = self.plant.state
         if action is None:
             if self.env is not None:
-                y = self.env.measure(state)                    # camera: position only
-                xhat = self.estimator.update(y, self._u_prev)  # Kalman estimate
+                readings = self.env.sense(state)               # IMU + delayed channels
+                xhat = self.estimator.update(                  # Kalman estimate
+                    readings=readings, control=self._u_prev,
+                    acceleration=readings.imu,
+                )
             else:
                 xhat = state
             with torch.no_grad():

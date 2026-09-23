@@ -40,6 +40,8 @@
           <button id="export-btn" class="icon-btn" title="Export MP4 of the SNN (server)" disabled>⤓</button>
           <span class="pill pill-idle" id="capture-pill">idle</span>
         </span>
+        <a id="extended-link" class="x-link" href="./extended.html"
+           title="Full-information view: all state estimates, estimator internals, per-frame readout">EXTENDED ↗</a>
       </div>
     </header>
 
@@ -54,6 +56,7 @@
           <span><i class="key key-target"></i> target</span>
           <span><i class="key key-ann"></i> FLY-LIKE ANN</span>
           <span><i class="key key-snn"></i> SNN TRANSFERRED</span>
+          <span id="legend-fix" class="hidden"><i class="key key-fix"></i> checkpoint fix</span>
         </div>
       </section>
 
@@ -62,26 +65,21 @@
         <section class="panel panel-controller">
           <h2>Controller pipeline</h2>
           <div id="controller-pipeline" class="pipeline" data-phase="plant">
-            <div class="pipe-row node-plant">
+            <div class="pipe-row node-plant" data-phase-row="plant">
               <span class="pr-rule"></span>
               <span class="pr-label">PLANT</span>
               <span class="pr-value" id="pipe-plant">BALL + PLATE</span>
             </div>
-            <div class="pipe-row node-camera">
-              <span class="pr-rule"></span>
-              <span class="pr-label">CAMERA</span>
-              <span class="pr-value">y = [x, y] + v
-                <span class="pr-sub">position-only · noisy · delayed</span>
-              </span>
-            </div>
-            <div class="pipe-row node-kalman">
+            <!-- one row per sensor channel, rendered from the example catalogue -->
+            <div id="pipe-sensors" class="pipe-sensors" data-phase-row="sensors"></div>
+            <div class="pipe-row node-kalman" data-phase-row="kalman">
               <span class="pr-rule"></span>
               <span class="pr-label">KALMAN</span>
               <span class="pr-value" id="pipe-kalman">x̂ = [x, y, vx, vy]
                 <span class="pr-sub">delay-aware state estimate</span>
               </span>
             </div>
-            <div class="pipe-row node-policy">
+            <div class="pipe-row node-policy" data-phase-row="policy">
               <span class="pr-rule"></span>
               <span class="pr-label">POLICY</span>
               <span class="pr-value">π(e) · FLY-LIKE ANN → SNN TRANSFERRED

@@ -3,7 +3,8 @@
 The original benchmark handed controllers the exact plant state.  This module
 inserts a realistic *body/environment* between the plant and the controller:
 
-* **sensing** — Gaussian sensor noise and a fixed observation delay,
+* **sensing** — a multi-channel suite (see :mod:`sim_engine.sensors`), each
+  channel with its own Gaussian noise and delay,
 * **actuation** — command delay, gain and bias,
 * **body** — velocity damping and a scaled rolling gain ``C``,
 * **perturbations** — continuous process noise and scheduled/random impulses.
@@ -11,18 +12,28 @@ inserts a realistic *body/environment* between the plant and the controller:
 It is deliberately deterministic: :meth:`EmbodiedEnv.reset` re-seeds a local RNG,
 so every controller evaluated with the same seed faces the **same disturbance
 realisation** (noise values, impulse timing and magnitudes).
+
+The channel suite is supplied by the example.  Without one, a single
+absolute-position camera is used — the historical behaviour, unchanged.
 """
 
 from __future__ import annotations
 
 from collections import deque
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import torch
 
 from .config import EMBODIMENT_PRESETS, EmbodimentConfig
 from .physics import C_CONST, DT, MAX_TILT, step_physics, step_point_mass
+from .sensors import (
+    FIX,
+    ResolvedChannel,
+    SensorModel,
+    SensorReadings,
+    camera_channel,
+)
 
 __all__ = ["EmbodiedEnv", "embodiment_specs"]
 
@@ -43,6 +54,27 @@ def _drone_step(state, command, *, dt, limit, gain, damping, disturbance):
     )
 
 
+def legacy_sensor_model(config: EmbodimentConfig, pos_dim: int) -> SensorModel:
+    """The historical single absolute-position camera, resolved from *config*."""
+    ch = camera_channel(pos_dim)
+    return SensorModel(
+        channels=(
+            ResolvedChannel(
+                kind=FIX,
+                axes=ch.axes,
+                sigma=float(config.sensor_noise_pos),
+                latency=int(config.sensor_delay),
+                description="camera y = p",
+            ),
+        ),
+        imu=None,
+        anchors=(),
+        launch=(),
+        pos_dim=int(pos_dim),
+        description="position-only camera",
+    )
+
+
 def embodiment_specs() -> dict:
     """All named presets with their fully resolved configuration (for API/UI)."""
     return {
@@ -52,7 +84,7 @@ def embodiment_specs() -> dict:
 
 
 class EmbodiedEnv:
-    """Observation + actuation + body model wrapped around :func:`step_physics`."""
+    """Observation + actuation + body model wrapped around the plant step."""
 
     def __init__(
         self,
@@ -66,6 +98,7 @@ class EmbodiedEnv:
         pos_dim: int = 2,
         plant_gain: float = -C_CONST,
         step_fn=None,
+        sensor: Optional[SensorModel] = None,
     ) -> None:
         self.config = config or EmbodimentConfig()
         self.dt = dt
@@ -77,10 +110,13 @@ class EmbodiedEnv:
         self.device = torch.device(device)
         self.dtype = dtype
         self.init_state = torch.as_tensor(init_state, dtype=dtype, device=self.device)
+        self.sensor = sensor or legacy_sensor_model(self.config, self.pos_dim)
 
         self._rng = np.random.default_rng(self.config.seed)
-        self._sensor_buf: deque = deque(maxlen=1)
         self._actuator_buf: deque = deque(maxlen=1)
+        self._buffers: Dict[str, deque] = {}
+        self._imu_sigma = 0.0
+        self._last_accel = torch.zeros(self.pos_dim, dtype=dtype, device=self.device)
         self.sensor_delay = 0
         self.actuator_delay = 0
         self.c_scale = self.config.c_scale
@@ -89,10 +125,12 @@ class EmbodiedEnv:
         self.impulse_interval = self.config.impulse_interval
         self.impulse_std = self.config.impulse_std
         self.impulse_count = 0
+        self.fix_count = 0
         self._k = 0
         self.last_disturbance = torch.zeros(self.pos_dim, dtype=dtype, device=self.device)
         self.last_kick = torch.zeros(self.pos_dim, dtype=dtype, device=self.device)
         self.last_impulse = False
+        self.last_fix_anchor: Optional[torch.Tensor] = None
         self.reset()
 
     # ------------------------------------------------------------------ setup
@@ -117,38 +155,126 @@ class EmbodiedEnv:
             lo, hi = cfg.damping_range
             self.damping = float(self._rng.uniform(lo, hi))
 
-        # Prefill both buffers with the initial position / zero command so the
-        # first frames are not an artificial delayed transient (the camera is
-        # position-only, so the sensor buffer holds 2-D vectors).
-        init_pos = self.init_state[:self.pos_dim].clone()
-        self._sensor_buf = deque(
-            [init_pos.clone() for _ in range(self.sensor_delay + 1)],
-            maxlen=self.sensor_delay + 1,
-        )
+        # Per-channel delay lines, prefilled with the initial sample so the first
+        # frames are not an artificial delayed transient.  A gated channel starts
+        # empty (no fix has happened yet).
+        d = self.pos_dim
+        self._buffers = {}
+        for ch in self.sensor.channels:
+            n = int(ch.latency) + 1
+            if ch.gate_range is not None:
+                self._buffers[ch.kind] = deque([None] * n, maxlen=n)
+            else:
+                init = (self.init_state[list(ch.axes)].clone(), None)
+                self._buffers[ch.kind] = deque([init] * n, maxlen=n)
+        self._imu_sigma = float(self.sensor.imu.sigma) if self.sensor.has_imu else 0.0
+
         zero = torch.zeros(self.pos_dim, dtype=self.dtype, device=self.device)
         self._actuator_buf = deque(
             [zero.clone() for _ in range(self.actuator_delay + 1)],
             maxlen=self.actuator_delay + 1,
         )
+        self._last_accel = zero.clone()
         self.impulse_count = 0
+        self.fix_count = 0
+        self._fix_active: set = set()
         self._k = 0
         self.last_disturbance = zero.clone()
         self.last_kick = zero.clone()
         self.last_impulse = False
+        self.last_fix_new = False
+        self.last_fix_anchor = None
 
     # --------------------------------------------------------------- sensing
-    def measure(self, state: torch.Tensor) -> torch.Tensor:
-        """Camera measurement ``y = [x, y] + v`` — position only, noisy and delayed.
+    def sense(self, state: torch.Tensor) -> SensorReadings:
+        """Sample every channel once for this frame.
 
-        Velocity is **not** measured; reconstructing it is the estimator's job.
+        The accelerometer reports the acceleration the body *achieved* over the
+        interval that just elapsed, so it is available as the filter's prediction
+        input for the step into this frame (no additional latency).  Every other
+        channel goes through its own delay line.
         """
         cfg = self.config
-        pos = state.detach().to(self.dtype)[:self.pos_dim].clone()
-        if cfg.sensor_noise_pos:
-            noise = self._rng.normal(0.0, cfg.sensor_noise_pos, size=self.pos_dim)
-            pos = pos + torch.as_tensor(noise, dtype=self.dtype, device=self.device)
-        self._sensor_buf.append(pos)
-        return self._sensor_buf[0]
+        state = torch.as_tensor(state, dtype=self.dtype, device=self.device)
+        out = SensorReadings()
+        self.last_fix_new = False
+
+        if self.sensor.has_imu:
+            imu = self._last_accel.clone()
+            if self._imu_sigma:
+                imu = imu + torch.as_tensor(
+                    self._rng.normal(0.0, self._imu_sigma, size=self.pos_dim),
+                    dtype=self.dtype, device=self.device,
+                )
+            out.imu = imu
+
+        for ch in self.sensor.channels:
+            current = self._sample(ch, state)
+            buf = self._buffers[ch.kind]
+            buf.append(current)
+            delayed = buf[0]
+            if delayed is None:
+                continue
+            value, anchor = delayed
+            out.channels[ch.kind] = value.clone()
+            if anchor is not None:
+                out.anchors[ch.kind] = anchor.clone()
+        return out
+
+    def _sample(self, ch: ResolvedChannel, state: torch.Tensor):
+        """One raw sample ``(value, anchor)`` for a channel, or ``None``."""
+        cfg = self.config
+        value = state[list(ch.axes)].clone()
+        anchor = None
+        if ch.gate_range is not None:
+            chosen = self._visible_anchor(ch, state)
+            if chosen is None:
+                self._fix_active.discard(ch.kind)
+                return None
+            _, c = chosen
+            anchor = c[list(ch.axes)].clone()
+            value = value - anchor
+            if ch.kind not in self._fix_active:
+                # a new acquisition ("entered the checkpoint's visible range")
+                self._fix_active.add(ch.kind)
+                self.fix_count += 1
+                self.last_fix_new = True
+            self.last_fix_anchor = anchor
+        if ch.sigma:
+            value = value + torch.as_tensor(
+                self._rng.normal(0.0, ch.sigma, size=ch.dim),
+                dtype=self.dtype, device=self.device,
+            )
+        return value, anchor
+
+    def _visible_anchor(self, ch: ResolvedChannel, state: torch.Tensor):
+        """Nearest anchor inside the geometry gate, as ``(index, position)``."""
+        p = state.detach()
+        if ch.gate_min_z is not None and float(p[2]) < float(ch.gate_min_z):
+            return None
+        best = None
+        for i, c in enumerate(self.sensor.anchors):
+            c_t = torch.as_tensor(c, dtype=self.dtype, device=self.device)
+            dist = float(torch.linalg.vector_norm(p[:len(c)] - c_t))
+            if dist <= float(ch.gate_range) and (best is None or dist < best[0]):
+                best = (dist, i, c_t)
+        if best is None:
+            return None
+        return best[1], best[2]
+
+    def measure(self, state: torch.Tensor) -> torch.Tensor:
+        """Legacy accessor: the absolute-position camera sample of this frame.
+
+        Performs one :meth:`sense` (so the delay lines advance exactly once) and
+        returns the camera channel.  Examples without an absolute-position camera
+        (e.g. the GPS-denied drone) raise: use :meth:`sense` there.
+        """
+        cam = self.sensor.camera_channel
+        if cam is None:
+            raise RuntimeError(
+                "this example has no absolute-position camera channel; use sense()"
+            )
+        return self.sense(state).channels[cam.kind]
 
     # -------------------------------------------------------------- actuation
     def actuate(self, command: torch.Tensor) -> torch.Tensor:
@@ -169,7 +295,7 @@ class EmbodiedEnv:
 
         ``accel`` is a continuous acceleration disturbance [m/s^2] (process noise);
         ``kick`` is a one-off **velocity** impulse [m/s] (``impulse_std``), applied
-        directly to the ball's velocity.
+        directly to the body's velocity.
         """
         cfg = self.config
         accel = torch.zeros(self.pos_dim, dtype=self.dtype, device=self.device)
@@ -204,9 +330,10 @@ class EmbodiedEnv:
         self.last_impulse = impulse
         if impulse:
             self.impulse_count += 1
+        d = self.pos_dim
+        v_before = state[d:2 * d].clone()
         if float(kick.abs().sum()) > 0.0:
             state = state.clone()
-            d = self.pos_dim
             state[d:2 * d] = state[d:2 * d] + kick
         nxt = self.step_fn(
             state,
@@ -217,6 +344,9 @@ class EmbodiedEnv:
             damping=self.damping,
             disturbance=accel,
         )
+        # The accelerometer would read the velocity change actually achieved,
+        # including damping, actuator effects and velocity kicks.
+        self._last_accel = (nxt[d:2 * d] - v_before) / self.dt
         self._k = step_k + 1
         return nxt
 
@@ -229,7 +359,10 @@ class EmbodiedEnv:
             "clean": cfg.is_clean,
             "pos_dim": self.pos_dim,
             "sensor_noise_pos": cfg.sensor_noise_pos,
+            "sensor_noise_scale": cfg.sensor_noise_scale,
             "sensor_delay": self.sensor_delay,
+            "sensor": self.sensor.to_dict(),
+            "fix_count": self.fix_count,
             "actuator_delay": self.actuator_delay,
             "actuator_gain": cfg.actuator_gain,
             "actuator_bias": cfg.actuator_bias,

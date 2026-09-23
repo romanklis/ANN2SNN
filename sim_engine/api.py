@@ -100,6 +100,7 @@ def config_from_dict(data: Optional[dict] = None) -> EngineConfig:
     flat_emb = {
         "sensor_noise_pos": "sensor_noise_pos",
         "sensor_delay": "sensor_delay",
+        "sensor_noise_scale": "sensor_noise_scale",
         "actuator_delay": "actuator_delay",
         "disturbance_std": "process_noise",
         "damping": "damping",

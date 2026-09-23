@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ANN2SNN · extended view — all state estimates</title>
+  </head>
+  <body class="extended">
+    <header class="topbar">
+      <div class="brand">
+        <span class="dot"></span>
+        <div class="titles">
+          <h1>ANN2SNN <span class="x-tag">EXTENDED</span></h1>
+          <span class="tagline">ALL STATE ESTIMATES · ESTIMATOR INTERNALS</span>
+        </div>
+      </div>
+      <div class="status">
+        <a class="x-link" href="./" title="Back to the single-screen experiment">← hero view</a>
+        <span class="pill pill-idle" id="run-pill">● PAUSED</span>
+        <span class="pill pill-idle" id="success-pill">○ IN BOUNDS</span>
+        <span class="clock mono" id="clock">t = 0.00 s</span>
+        <span class="meta mono" id="frame-readout">frame 0 / 0</span>
+        <span class="sep"></span>
+        <label class="env">
+          <span class="env-label">EXAMPLE</span>
+          <select id="example-select" title="Example to inspect" disabled></select>
+        </label>
+        <label class="env">
+          <span class="env-label">ENV</span>
+          <select id="env-select" title="Body / environment preset" disabled></select>
+        </label>
+        <label class="env">
+          <span class="env-label">SEED</span>
+          <input id="seed-input" class="num mono" type="number" min="0" max="100000" value="42" />
+        </label>
+        <label class="env">
+          <span class="env-label">STEPS</span>
+          <input id="steps-input" class="num mono" type="number" min="10" max="2000" value="500" />
+        </label>
+        <span class="pill pill-idle" id="api-pill">connecting…</span>
+        <span class="pill pill-idle" id="trained-pill">untrained</span>
+        <button id="export-json-btn" class="icon-btn" title="Download the full JSON payload" disabled>⤓</button>
+      </div>
+    </header>
+
+    <div id="error-banner" class="banner banner-error hidden" role="alert"></div>
+
+    <details class="x-picker" id="controller-picker">
+      <summary>Controllers <span id="picker-count" class="meta mono">—</span></summary>
+      <div id="picker-body" class="x-picker-body"></div>
+    </details>
+
+    <main class="x-grid">
+      <!-- left column: the run, its controls and the frame inspector -------- -->
+      <div class="x-col">
+        <section class="panel panel-stage x-stage">
+          <canvas id="stage"></canvas>
+          <div id="stage-legend" class="stage-legend">
+            <span><i class="key key-target"></i> target</span>
+            <span><i class="key key-fix"></i> checkpoint fix</span>
+          </div>
+        </section>
+
+        <section class="panel x-controls">
+          <h2>Cursor</h2>
+          <div class="x-controls-row">
+            <button id="play-btn" class="play-btn small" title="Play / pause" disabled>▶</button>
+            <button id="step-back-btn" class="icon-btn" title="Step back one frame" disabled>−1</button>
+            <button id="step-fwd-btn" class="icon-btn" title="Step forward one frame" disabled>+1</button>
+            <input id="scrub" class="x-scrub" type="range" min="0" max="0" value="0" step="1" disabled />
+            <label class="x-check"><input id="all-toggle" type="checkbox" /> full traces</label>
+          </div>
+        </section>
+
+        <section class="panel x-spikes">
+          <h2 id="spike-title">Spike activity</h2>
+          <div class="canvas-wrap x-spike-wrap"><canvas id="spikes"></canvas></div>
+        </section>
+
+        <section class="panel">
+          <h2>Frame readout <span class="unit" id="readout-note"></span></h2>
+          <div class="table-scroll" id="readout"></div>
+        </section>
+
+        <section class="panel">
+          <h2>Spike statistics</h2>
+          <div class="table-scroll" id="table-spikes"></div>
+        </section>
+      </div>
+
+      <!-- right column: the lanes and the full tables ----------------------- -->
+      <div class="x-col">
+        <section class="panel">
+          <h2>Position · reference / true / estimate <span class="unit">[m]</span></h2>
+          <div class="canvas-wrap x-lane" id="wrap-pos"><canvas id="lane-pos"></canvas></div>
+        </section>
+
+        <section class="panel">
+          <h2>Velocity · reference / true / estimate <span class="unit">[m/s]</span></h2>
+          <div class="canvas-wrap x-lane" id="wrap-vel"><canvas id="lane-vel"></canvas></div>
+        </section>
+
+        <section class="panel">
+          <h2>Tracking error per axis <span class="unit">[cm]</span></h2>
+          <div class="canvas-wrap x-lane" id="wrap-track"><canvas id="lane-track"></canvas></div>
+        </section>
+
+        <section class="panel">
+          <h2>Estimation error x̂ − x per axis <span class="unit">[cm]</span></h2>
+          <div class="canvas-wrap x-lane" id="wrap-est"><canvas id="lane-est"></canvas></div>
+        </section>
+
+        <section class="panel">
+          <h2>Command · commanded (solid) vs applied (dashed) <span class="unit" id="cmd-unit"></span></h2>
+          <div class="canvas-wrap x-lane" id="wrap-cmd"><canvas id="lane-cmd"></canvas></div>
+        </section>
+
+        <section class="panel">
+          <h2>Disturbance &amp; reference acceleration <span class="unit">[m/s²]</span></h2>
+          <div class="canvas-wrap x-lane" id="wrap-dist"><canvas id="lane-dist"></canvas></div>
+        </section>
+
+        <section class="panel">
+          <h2>Innovations z − H·x̂ per sensor channel</h2>
+          <div class="canvas-wrap x-lane" id="wrap-innov"><canvas id="lane-innov"></canvas></div>
+        </section>
+
+        <section class="panel">
+          <h2>Covariance σ = √diag(P) per state component</h2>
+          <div class="canvas-wrap x-lane" id="wrap-cov"><canvas id="lane-cov"></canvas></div>
+        </section>
+
+        <section class="panel">
+          <h2>Per-controller metrics</h2>
+          <div class="table-scroll" id="table-metrics"></div>
+        </section>
+
+        <section class="panel">
+          <h2>Estimator</h2>
+          <div class="table-scroll" id="table-estimator"></div>
+        </section>
+
+        <section class="panel">
+          <h2>Environment &amp; sensors</h2>
+          <div class="table-scroll" id="table-env"></div>
+        </section>
+
+        <section class="panel">
+          <h2>Run configuration</h2>
+          <div class="table-scroll" id="table-config"></div>
+        </section>
+
+        <section class="panel">
+          <h2>Robustness sweep · mean error cm (ANN / SNN)</h2>
+          <div class="table-scroll" id="table-robust"></div>
+        </section>
+      </div>
+    </main>
+
+    <script type="module" src="./src/extended.js"></script>
+  </body>
+</html>

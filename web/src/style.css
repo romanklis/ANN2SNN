@@ -159,6 +159,7 @@ body {
 .key-target { background: transparent; border: 2px dashed #aeb9c6; border-radius: 3px; }
 .key-ann { background: #ffb454; }
 .key-snn { background: #7ee0c0; box-shadow: 0 0 0 2px #eaf6ff; }
+.key-fix { background: transparent; border: 2px solid #b48cff; border-radius: 50%; }
 
 .canvas-wrap { flex: 1 1 auto; min-height: 0; position: relative; }
 #spikes, #control-out, #tracking { display: block; width: 100%; height: 100%; }
@@ -184,6 +185,19 @@ body {
   transition: opacity .3s ease, color .3s ease;
 }
 .pipe-row.on { opacity: 1; }
+/* the sensor block is one reveal phase holding one row per channel */
+.pipe-sensors {
+  flex: 0 0 auto;
+  opacity: .5;
+  transition: opacity .3s ease;
+}
+.pipe-sensors.on { opacity: 1; }
+.pipe-sensors .pipe-row { padding: 3px 0; }
+.pipe-sensors .pipe-row .pr-rule { border-left-style: dotted; }
+/* a checkpoint fix row lights up on the frames a beacon is in range */
+.pipe-row.row-fix.active .pr-label { color: var(--accent-2); }
+.pipe-row.row-fix.active .pr-rule { border-left-color: var(--accent-2); }
+.pipe-row.row-fix.active .pr-value { color: var(--accent-2); }
 .pr-rule {
   position: relative;
   align-self: stretch;
@@ -276,4 +290,94 @@ body {
   .dash { grid-template-columns: 1fr; grid-template-rows: minmax(240px, 46vh) auto; }
   .side { grid-template-rows: auto 220px 200px 200px; }
   .rb-note { margin-left: 0; text-align: left; }
+}
+
+/* ------------------------------------------------------------------------- */
+/* Extended view (web/extended.html) — full-information inspector.            */
+/* The hero page is a fixed, no-scroll screen; this page scrolls instead.     */
+/* ------------------------------------------------------------------------- */
+body.extended {
+  display: block;
+  height: auto;
+  min-height: 100%;
+  overflow: auto;
+}
+body.extended .topbar { position: sticky; top: 0; z-index: 5; }
+.x-tag {
+  font-size: 9px;
+  letter-spacing: .12em;
+  color: var(--bg);
+  background: var(--accent);
+  border-radius: 4px;
+  padding: 1px 5px;
+  vertical-align: middle;
+}
+.x-link {
+  font-size: 11px;
+  color: var(--accent);
+  text-decoration: none;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 3px 8px;
+  white-space: nowrap;
+}
+.x-link:hover { border-color: var(--accent); color: var(--text); }
+.num {
+  width: 74px;
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 3px 6px;
+  font-size: 11px;
+}
+.x-picker {
+  margin: 10px 18px 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: rgba(23, 30, 45, 0.6);
+  padding: 6px 10px;
+}
+.x-picker summary { cursor: pointer; font-size: 11px; letter-spacing: .06em; color: var(--text); }
+.x-picker-body { display: flex; flex-wrap: wrap; gap: 6px 16px; padding: 8px 2px 2px; }
+.x-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--text);
+  cursor: pointer;
+}
+.x-check input { accent-color: var(--accent); }
+.x-chip { width: 9px; height: 9px; border-radius: 2px; display: inline-block; }
+.x-grid {
+  display: grid;
+  grid-template-columns: minmax(360px, 460px) minmax(0, 1fr);
+  gap: 12px;
+  padding: 12px 18px 44px;
+  align-items: start;
+}
+.x-col { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+.x-stage { height: 380px; position: relative; }
+.x-stage canvas { width: 100%; height: 100%; display: block; }
+.x-controls-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 6px 12px 10px; }
+.x-scrub { flex: 1 1 160px; min-width: 120px; accent-color: var(--accent); }
+.play-btn.small { width: 30px; height: 30px; font-size: 11px; }
+.canvas-wrap.x-lane { height: 150px; }
+.canvas-wrap.x-spike-wrap { height: 190px; }
+.table-scroll { max-height: 320px; overflow: auto; padding: 2px 12px 10px; }
+.xtable { width: 100%; border-collapse: collapse; font-size: 10.5px; }
+.xtable th, .xtable td {
+  text-align: left;
+  padding: 3px 8px;
+  border-bottom: 1px solid rgba(42, 53, 71, 0.6);
+  white-space: nowrap;
+}
+.xtable th { color: var(--muted); font-weight: 700; letter-spacing: .04em; position: sticky; top: 0; background: var(--panel); }
+.xtable td.num, .xtable th.num { text-align: right; font-variant-numeric: tabular-nums; }
+.xtable tr:hover td { background: rgba(77, 163, 255, 0.06); }
+.x-sub { margin: 8px 0 3px; font-size: 10px; letter-spacing: .08em; color: var(--accent); }
+.x-empty { font-size: 10.5px; color: var(--muted); padding: 4px 0; }
+@media (max-width: 1100px) {
+  .x-grid { grid-template-columns: 1fr; }
 }

@@ -32,6 +32,7 @@ def test_registry_lists_builtin_examples():
     catalog = {e["name"]: e for e in list_examples()}
     assert catalog["ball"]["label"] == "Balancing ball"
     assert catalog["drone"]["label"] == "Hovering drone"
+    assert catalog["drone_gps_denied"]["label"] == "GPS-denied drone"
 
 
 def test_unknown_example_is_rejected():
@@ -47,6 +48,32 @@ def test_spec_dimensions():
     assert (drone.pos_dim, drone.n_in, drone.n_out) == (3, 9, 3)
     assert drone.control_limit == pytest.approx(MAX_THRUST)
     assert drone.plant_gain == pytest.approx(1.0)
+
+
+def test_gps_denied_spec_is_the_drone_plant_with_onboard_sensors():
+    gps = get_example("drone_gps_denied")
+    drone = get_example("drone")
+    # same plant/task/dims as the plain drone ...
+    assert (gps.pos_dim, gps.n_in, gps.n_out) == (drone.pos_dim, drone.n_in, drone.n_out)
+    assert gps.control_limit == pytest.approx(drone.control_limit)
+    assert gps.plant_gain == pytest.approx(drone.plant_gain)
+    assert gps.bounds_high == drone.bounds_high
+    assert gps.renderer == "quad"
+    assert gps.launch == (0.0,) * 6
+    # ... but no absolute-position camera: an IMU-driven suite instead
+    kinds = [c.kind for c in gps.sensor.channels]
+    assert kinds == ["imu", "altitude", "flow_velocity", "position_fix"]
+    assert gps.sensor.prediction_channel.kind == "imu"
+    assert gps.sensor.fix_channel.gate_range is not None
+    assert len(gps.sensor.anchors) == 3
+    # the estimator fed by that suite reports a different `h`
+    est = gps.make_estimator(EmbodimentConfig()).describe()
+    assert est["multi_channel"] is True
+    assert est["seeded_from_launch"] is True
+    assert "altitude" in est["measurement"] and "position-only" not in est["measurement"]
+    assert get_example("ball").make_estimator(EmbodimentConfig()).describe()[
+        "measurement"
+    ].startswith("position-only")
 
 
 # --------------------------------------------------------------------------- #

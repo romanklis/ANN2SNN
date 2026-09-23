@@ -131,6 +131,12 @@ Environment variables:
 > pre-distils at build time, so it starts trained. Set `ANN2SNN_AUTO_TRAIN=0` to
 > skip this and run the honest untrained baselines instead (or use the UI's
 > **Distill** button / `tools/generate_videos.py`).
+>
+> Bundles are cached **per example** (`weights_drone_gps_denied.pt`, …) and are
+> dimensioned by it (6→2 policy for the ball, 9→3 for the drones), so the loader
+> reads the widths from the bundle itself and a bundle pinned for one example is
+> never used by another. A stale or mismatched bundle is logged and skipped
+> (the engine falls back to untrained) rather than failing the request.
 
 ## API
 
@@ -198,26 +204,38 @@ every panel.
   ANN is drawn 1 px larger so a thin amber rim stays visible. Off-plate balls are
   clamped red at the plate edge; an isometric legend keys
   target / FLY-LIKE ANN / SNN TRANSFERRED.
-* **Controller pipeline (right, top)** — four compact rows describing the closed
-  loop: `PLANT (ball + plate) → CAMERA (y = [x, y] + v) → KALMAN (x̂) → POLICY
-  (π(e), e = x̂ − r, u = π(e, u_ff))`, with `FLY-LIKE ANN → SNN TRANSFERRED` as the
-  policy label and a footnote that the weight transfer is **offline** (not part of
-  the loop). On load (and on each loop / record start) a ~1.8 s scripted reveal
-  highlights the rows in order and settles on POLICY.
+* **Controller pipeline (right, top)** — compact rows describing the closed
+  loop: `PLANT → SENSORS → KALMAN (x̂) → POLICY (π(e), e = x̂ − r, u = π(e, u_ff))`,
+  with `FLY-LIKE ANN → SNN TRANSFERRED` as the policy label and a footnote that the
+  weight transfer is **offline** (not part of the loop). The SENSORS block is
+  rendered from the selected example's catalogue: the ball/drone show the single
+  `CAMERA (y = [x, y] + v)` row, while `drone_gps_denied` lists `IMU / BARO / FLOW /
+  FIX`, with the FIX row lighting up on the frames a beacon is in range. On load
+  (and on each loop / record start) a ~1.8 s scripted reveal highlights the rows in
+  order and settles on POLICY.
 * **Spike activity (right)** — the SNN's spikes on a Canvas 2D raster that
   advances with the shared frame cursor; titled
   `first 200 of <N> neurons` (`N` is the engine's neuron count).
-* **Control output (right)** — the SNN's plate tilt `θx`/`θy` in rad (Canvas 2D
-  line chart, zero line).
-* **Tracking (right)** — radial tracking error in cm vs time: `flylike_ann` solid,
+* **Control output (right)** — the SNN's actuator command per controlled axis
+  (plate tilt `θx`/`θy` in rad, or thrust `ax`/`ay`/`az` in m/s²) as a Canvas 2D
+  line chart with a zero line.
+* **Tracking (right)** — tracking error in cm vs time: `flylike_ann` solid,
   `snn_transferred` dashed.
 * **Single Play/Pause** — one round button drives the whole shared cursor
-  (looping). Fixed defaults: seed 42, 500 steps (10 s at 50 Hz), radius 0.15 m,
-  0.5 Hz.
+  (looping). Fixed defaults: seed 42, 500 steps (10 s at 50 Hz); the trajectory
+  amplitude/frequency come from the selected example (ball: 0.15 m at 0.5 Hz;
+  drone: 0.6 m at 0.25 Hz).
 * **Header** — `● RUNNING`, live `t = … s`, `● SPIKING`, neuron/frame counts, seed,
   API/trained badges.
 * **Result bar (footer)** — `TRANSFER EXPERIMENT`: fly-like ANN error ·
-  SNN error · `Δ = SNN − ANN` (neutral wording, no winner).
+  SNN error · `Δ = SNN − ANN` (neutral wording, no winner), plus the estimation
+  line from the selected example's metrics: `x̂ RMSE` and, when the suite has a
+  checkpoint channel, the per-axis RMSE, the worst drift after the first fix and
+  the frame of that first fix.
+* **Example selector (header)** — `Balancing ball · Hovering drone · GPS-denied
+  drone`; switching relabels the panels, the pipeline channels, the stage renderer
+  and the success label from the catalogue (see
+  [`EXAMPLES.md`](EXAMPLES.md#gps-denied-drone)).
 * **Environment selector (header)** — `Clean · Noisy · Delayed · Perturbed · Heavy ·
   Embodied · Randomized` (default **Embodied**) with a `clean`/`robust` policy pill;
   selecting an embodied preset switches to the robust policy (auto-distilled and
@@ -225,6 +243,54 @@ every panel.
   preset. See [`EMBODIMENT.md`](EMBODIMENT.md).
 * **Capture (header icons)** — `●` records the stage-only WebM; `▣` records the
   whole browser tab; `⤓` downloads a server-rendered MP4 of the SNN.
+* **EXTENDED ↗ (header link)** — opens the full-information view described below,
+  pre-selecting the current example/environment/seed/steps.
+
+## Extended view (`/extended`)
+
+A second page (same engine, same API, same bundle) for inspecting *everything* a run
+produces rather than watching it. It is deep-linked from the hero page and reads
+`?example=&env=&seed=&steps=&controllers=` so both pages agree on the selection.
+
+One `POST /api/benchmark` with **`trace_level: "full"`** returns the base traces plus
+the estimator internals and the environment side-channels:
+
+| field | shape | meaning |
+|---|---|---|
+| `applied` | `(T, D)` | actuated/limited command actually stepped into the plant (`tilts` stays the *commanded* one) |
+| `disturbances` | `(T, D)` | per-frame equivalent disturbance acceleration |
+| `impulse_frames` | `[int]` | frames where a velocity kick fired |
+| `measurements_by_channel` | `{kind: [(dim,) \| null]}` | the delayed samples the filter consumed, with gaps where nothing was sampled |
+| `innovations` | `{kind: [(dim,) \| null]}` | `z − H·x̂`, recorded at the index the sample *refers to* |
+| `covariance_diag` | `(T, 2D)` | posterior `diag(P)` per state component |
+| `success` | `(T,)` | in-bounds flags from the example's bounds |
+
+`trace_level` defaults to `"short"`, which is byte-for-byte the payload the hero page
+uses — the new series are opt-in. Like the base traces, an index always equals a
+control frame (the launch point seeds index 0 without predicting). A sensor's latency
+delays *delivery*, not the index: the fix sensed at frame `f` is folded into index `f`
+and becomes visible in `measurements_by_channel` at frame `f + latency`.
+
+The page itself:
+
+* **Cursor** — Play/Pause, a scrubber, `−1`/`+1` stepping, and a **full traces**
+  toggle that draws the whole episode instead of only up to the cursor.
+* **Lanes** (one Canvas per quantity, rows = axes or sensor components, series = the
+  selected controllers): position `r`/`p`/`x̂`, velocity, per-axis tracking error,
+  per-axis estimation error `x̂ − x`, command (commanded solid vs applied dashed),
+  disturbance + reference acceleration with impulse markers, innovations per channel
+  component, and `σ = √diag(P)` per state component.
+* **Frame readout** — the numbers at the cursor: `t`, in-bounds, and per axis
+  `p, r, e, x̂, ê, v, v̂, u_cmd, u_applied, σ`, plus every innovation component.
+* **Tables** — per-controller metrics (incl. per-axis `x̂` RMSE, max drift, first fix),
+  the estimator and its resolved channels, the environment/sensor degradation, the run
+  configuration, the robustness sweep, and spike statistics (total/active neurons,
+  firing rates, busiest neurons).
+* **Stage** — the same isometric/3-D renderer as the hero, showing every selected
+  controller, the checkpoint fixes and the belief ghosts.
+* **Controller picker** — any catalogue controller (max 4 at once, since every
+  selected controller is requested in one benchmark); ⤓ downloads the exact JSON
+  payload. A two-controller, 500-step drone run is ≈1.6 MB with the full trace.
 
 ## Demo-video CLI
 
@@ -249,9 +315,16 @@ python3 -m pytest tests server/tests tools/tests -q
 
 * `server/tests/test_api.py` — health, catalogue, simulate (all controllers,
   aliases, spike formats, determinism, geometry), multi/benchmark, validation,
-  sessions, distillation job, MP4 export (skipped without ffmpeg), CORS.
+  sessions, distillation job, MP4 export (skipped without ffmpeg), CORS,
+  `trace_level` (`short` default / `full` telemetry / 400 on garbage).
 * `server/tests/test_static_dashboard.py` — build integrity, static serving,
-  `/api/*` not shadowed, dashboard contract (skips until the bundle is built).
+  `/api/*` not shadowed, dashboard contract, the extended page (built assets, ids,
+  its scroll override, both `/extended` and `/extended.html`), the hero → extended
+  link (skips until the bundle is built).
+* `tests/test_trace_levels.py` — the extended telemetry contract: key gating, shapes,
+  per-channel index alignment and `null` gaps, innovation magnitudes vs the sensor σ,
+  covariance positivity and the drop at a checkpoint fix, commanded-vs-applied
+  actuator behaviour, impulse frames, determinism.
 * `tools/tests/test_render_smoke.py` — tiny MP4 render + `ffprobe` (skipped
   without ffmpeg).
 
