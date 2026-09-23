@@ -22,13 +22,13 @@ import torch
 import torch.nn as nn
 
 from ..physics import (
+    C_CONST,
     MAX_TILT,
     N_IN,
     N_NEURONS,
     N_OUT,
     SYNAPSES_PER_NEURON,
     TOTAL_SYNAPSES,
-    clamp_action,
 )
 from .base import BaseController, error_vector
 
@@ -148,9 +148,14 @@ class ConnectomeANNController(nn.Module, BaseController):
         device="cpu",
         dtype=torch.float32,
         topology: ConnectomeTopology | None = None,
+        plant_gain: float = -C_CONST,
+        pos_dim: int | None = None,
     ) -> None:
         nn.Module.__init__(self)
-        BaseController.__init__(self, n_in=n_in, n_out=n_out, device=device)
+        BaseController.__init__(
+            self, n_in=n_in, n_out=n_out, device=device,
+            action_limit=max_tilt, plant_gain=plant_gain, pos_dim=pos_dim,
+        )
         self.n_neurons = n_neurons
         self.n_out = n_out
         self.max_tilt = max_tilt
@@ -196,7 +201,7 @@ class ConnectomeANNController(nn.Module, BaseController):
         w_sparse = self.get_sparse_matrix()
         recurrent_drive = torch.sparse.mm(w_sparse, h_prev.T).T
         h = self.relu(self.w_in(err_state) + recurrent_drive)
-        tilt = clamp_action(self.w_out(h), self.max_tilt)
+        tilt = torch.clamp(self.w_out(h), -self.action_limit, self.action_limit)
         return tilt, h
 
     # -- BaseController ----------------------------------------------------- #

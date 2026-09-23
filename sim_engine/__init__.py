@@ -27,6 +27,8 @@ from __future__ import annotations
 from . import physics, reference, serialization
 from .benchmark import BenchmarkReport, TrajectoryResult, evaluate, run_closed_loop
 from .config import (
+    DEFAULT_EXAMPLE,
+    DEFAULT_STEPS,
     EMBODIMENT_PRESETS,
     BenchmarkConfig,
     EmbodimentConfig,
@@ -36,6 +38,15 @@ from .config import (
     TrainingConfig,
 )
 from .environment import EmbodiedEnv, embodiment_specs
+from .examples import (
+    DEFAULT_EXAMPLE as _DEFAULT_EXAMPLE,
+    ExamplePlant,
+    ExampleSpec,
+    example_names,
+    get_example,
+    list_examples,
+    register_example,
+)
 from .controllers import (
     BaseController,
     ClassicalPDController,
@@ -47,18 +58,30 @@ from .controllers import (
 from .engine import Engine, SimulationSession
 from .physics import (
     C_CONST,
+    DRONE_HALF,
     DT,
     GRAVITY,
+    MAX_THRUST,
     MAX_TILT,
     N_IN,
     N_NEURONS,
     N_OUT,
+    PLATE_HALF,
+    STATE_DIM,
     SYNAPSES_PER_NEURON,
     TOTAL_SYNAPSES,
     BallPlatePlant,
+    PointMass3D,
     step_physics,
+    step_point_mass,
 )
-from .reference import RefPoint, Reference, orbit_reference
+from .reference import (
+    RefPoint,
+    Reference,
+    lissajous_reference,
+    orbit_reference,
+    setpoint_reference,
+)
 from .registry import CANONICAL_CONTROLLERS, ControllerRegistry
 from .serialization import to_jsonable
 
@@ -67,19 +90,24 @@ __version__ = "0.1.0"
 __all__ = [
     "__version__",
     # physics
-    "step_physics", "BallPlatePlant",
-    "GRAVITY", "C_CONST", "DT", "MAX_TILT",
+    "step_physics", "BallPlatePlant", "step_point_mass", "PointMass3D",
+    "GRAVITY", "C_CONST", "DT", "MAX_TILT", "PLATE_HALF",
+    "MAX_THRUST", "DRONE_HALF", "STATE_DIM",
     "N_IN", "N_OUT", "N_NEURONS", "SYNAPSES_PER_NEURON", "TOTAL_SYNAPSES",
     # controllers
     "BaseController", "ClassicalPDController", "DenseNNController",
     "ConnectomeANNController", "ConnectomeTopology", "LosslessConnectomeSNN",
     # config
     "PlantConfig", "NetworkConfig", "BenchmarkConfig", "TrainingConfig", "EngineConfig",
-    "EmbodimentConfig", "EMBODIMENT_PRESETS",
+    "EmbodimentConfig", "EMBODIMENT_PRESETS", "DEFAULT_STEPS", "DEFAULT_EXAMPLE",
     # environment
     "EmbodiedEnv", "embodiment_specs",
+    # examples
+    "ExampleSpec", "ExamplePlant", "get_example", "list_examples",
+    "example_names", "register_example",
     # reference
-    "RefPoint", "Reference", "orbit_reference",
+    "RefPoint", "Reference", "orbit_reference", "lissajous_reference",
+    "setpoint_reference",
     # orchestration
     "Engine", "SimulationSession", "ControllerRegistry", "CANONICAL_CONTROLLERS",
     # benchmark

@@ -40,6 +40,12 @@ MAX_TILT: float = 0.25
 PLATE_HALF: float = 0.25
 """Half-side of the physical plate [m]; a ball beyond this has left the plate."""
 
+MAX_THRUST: float = 3.0
+"""Actuator saturation for the drone: max acceleration command [m/s^2] per axis."""
+
+DRONE_HALF: float = 1.0
+"""Half-extent of the drone's allowed corridor [m] (success bound)."""
+
 # --------------------------------------------------------------------------- #
 # Network dimensions
 # --------------------------------------------------------------------------- #
@@ -206,3 +212,83 @@ class BallPlatePlant:
     @property
     def position(self) -> torch.Tensor:
         return self.state[:2]
+
+
+# --------------------------------------------------------------------------- #
+# Drone: 3-D point mass driven by an acceleration (thrust-vector) command
+# --------------------------------------------------------------------------- #
+def step_point_mass(
+    state: torch.Tensor,
+    command: torch.Tensor,
+    dt: float = DT,
+    max_accel: float = MAX_THRUST,
+    damping: float = 0.0,
+    disturbance: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Advance a ``dim``-dimensional point mass by one timestep.
+
+    Same structure as :func:`step_physics`, generalised in dimension:
+
+        ``a = u + d - damping * v``, ``v' = v + a*dt``, ``p' = p + v'*dt``
+
+    with ``state = [p, v]`` concatenated and ``u`` clamped to
+    ``[-max_accel, +max_accel]`` per axis.  Defaults reproduce a plain
+    double integrator (gain 1, no damping, no disturbance).
+    """
+    d = int(command.shape[0])
+    u = torch.clamp(command, -max_accel, max_accel)
+    p, v = state[:d], state[d:]
+
+    a = u
+    if damping:
+        a = a - damping * v
+    if disturbance is not None:
+        a = a + torch.as_tensor(disturbance, dtype=state.dtype, device=state.device)
+
+    v_next = v + a * dt
+    p_next = p + v_next * dt
+    return torch.cat([p_next, v_next])
+
+
+class PointMass3D:
+    """Stateful 3-D point-mass plant ``[x, y, z, vx, vy, vz]`` (the drone)."""
+
+    def __init__(
+        self,
+        init_state=(0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+        dt: float = DT,
+        max_accel: float = MAX_THRUST,
+        damping: float = 0.0,
+        device="cpu",
+        dtype=torch.float32,
+    ) -> None:
+        self.init_state = torch.as_tensor(init_state, dtype=dtype, device=device)
+        self.dt = dt
+        self.max_accel = max_accel
+        self.damping = damping
+        self.device = torch.device(device)
+        self.dtype = dtype
+        self.state = self.init_state.clone()
+        self.t = 0
+
+    def reset(self) -> torch.Tensor:
+        self.state = self.init_state.clone()
+        self.t = 0
+        return self.state.clone()
+
+    def step(self, command: torch.Tensor, disturbance: torch.Tensor | None = None) -> torch.Tensor:
+        command = torch.as_tensor(command, dtype=self.dtype, device=self.device)
+        self.state = step_point_mass(
+            self.state,
+            command,
+            dt=self.dt,
+            max_accel=self.max_accel,
+            damping=self.damping,
+            disturbance=disturbance,
+        )
+        self.t += 1
+        return self.state.clone()
+
+    @property
+    def position(self) -> torch.Tensor:
+        return self.state[:3]

@@ -77,6 +77,7 @@ from sim_engine.environment import (  # noqa: E402
     EmbodiedEnv,
     embodiment_specs,
 )
+from sim_engine.examples import example_names, get_example, list_examples  # noqa: E402
 from sim_engine.physics import DT, MAX_TILT  # noqa: E402
 from sim_engine.registry import CANONICAL_CONTROLLERS, LABELS  # noqa: E402
 from sim_engine.robustness import DEFAULT_AXIS_POINTS, MAX_POINTS  # noqa: E402
@@ -91,6 +92,7 @@ from server.validation import (  # noqa: E402
     _as_spike_format,
     _body,
     _env_from_body,
+    _example_from_body,
     _profile_from_body,
     _spike_payload,
 )
@@ -234,26 +236,27 @@ def _reference_payload(reference) -> dict:
 
 def _run_one(controller: str, *, steps: int, radius: float, freq: float, seed: int,
              record_spikes: bool, spike_format: str, profile: str = "clean",
-             embodiment: Optional[EmbodimentConfig] = None) -> dict:
+             embodiment: Optional[EmbodimentConfig] = None,
+             example: str = "ball") -> dict:
     """Run a single controller and return the normalised dashboard payload."""
-    svc = RUNTIME.service(seed, profile, embodiment)
+    svc = RUNTIME.service(seed, profile, embodiment, example)
     engine = svc.engine
+    spec = get_example(example)
     canonical = engine.registry.resolve(controller)
     ctrl = engine.build_controller(canonical)
 
     reference = engine.reference(steps=steps, radius=radius, freq=freq)
     emb = embodiment or EmbodimentConfig()
     bc = BenchmarkConfig(steps=steps, radius=radius, freq=freq,
-                         record_spikes=record_spikes, embodiment=emb)
-    init_state = torch.tensor(engine.config.plant.init_state, dtype=torch.float32)
+                         record_spikes=record_spikes, embodiment=emb, example=example)
+    init_state = torch.tensor(spec.init_state, dtype=torch.float32)
 
     env = None
     if emb.enable:
-        env = EmbodiedEnv(emb, dt=reference.dt, max_tilt=MAX_TILT,
-                          init_state=engine.config.plant.init_state)
+        env = spec.make_env(emb, dt=reference.dt)
 
     res = run_closed_loop(ctrl, reference=reference, init_state=init_state,
-                          config=bc, name=canonical, env=env)
+                          config=bc, name=canonical, env=env, example=example)
     result = res.to_dict(include_trace=True)
     spikes = result.pop("spikes", None)
     payload = _spike_payload(spikes, spike_format)
@@ -264,6 +267,7 @@ def _run_one(controller: str, *, steps: int, radius: float, freq: float, seed: i
         "label": LABELS.get(canonical, canonical),
         "trained": bool(engine.registry.trained),
         "profile": profile,
+        "example": example,
         "seed": seed,
         "steps": steps,
         "radius": radius,
@@ -287,17 +291,19 @@ def _run_one(controller: str, *, steps: int, radius: float, freq: float, seed: i
 def _run_many(controllers: Sequence[str], *, steps: int, radius: float, freq: float,
               seed: int, record_spikes: bool, spike_format: str,
               include_trace: bool, profile: str = "clean",
-              embodiment: Optional[EmbodimentConfig] = None) -> dict:
+              embodiment: Optional[EmbodimentConfig] = None,
+              example: str = "ball") -> dict:
     """Run several controllers on one shared reference trajectory."""
-    svc = RUNTIME.service(seed, profile, embodiment)
+    svc = RUNTIME.service(seed, profile, embodiment, example)
     engine = svc.engine
+    spec = get_example(example)
     names = [engine.registry.resolve(c) for c in controllers]
 
     reference = engine.reference(steps=steps, radius=radius, freq=freq)
     emb = embodiment or EmbodimentConfig()
     bc = BenchmarkConfig(steps=steps, radius=radius, freq=freq,
-                         record_spikes=record_spikes, embodiment=emb)
-    init_state = torch.tensor(engine.config.plant.init_state, dtype=torch.float32)
+                         record_spikes=record_spikes, embodiment=emb, example=example)
+    init_state = torch.tensor(spec.init_state, dtype=torch.float32)
 
     built = {n: engine.build_controller(n) for n in names}
     report = evaluate(built, reference=reference, init_state=init_state, config=bc)
@@ -307,7 +313,9 @@ def _run_many(controllers: Sequence[str], *, steps: int, radius: float, freq: fl
     learned = {"dense_ann", "flylike_ann", "snn_transferred"}
 
     stats: Dict[str, Any] = {
+        "example": example,
         "plate_half_m": PLATE_HALF_M,
+        "bounds_high": list(spec.bounds_high),
         "trained": trained_registry,
         "ranking": list(body["ranking"]),
         "per_controller": {},
@@ -322,15 +330,9 @@ def _run_many(controllers: Sequence[str], *, steps: int, radius: float, freq: fl
         result["spiking"] = bool(
             result.get("meta", {}).get("controller", {}).get("spiking")
         )
-        # On-plate fraction from the controller's own plant trajectory.
+        # In-bounds fraction from the controller's own plant trajectory.
         traj = np.asarray(report.results[name].trajectory, dtype=float)
-        if traj.size:
-            inside = (np.abs(traj[:, 0]) <= PLATE_HALF_M) & (
-                np.abs(traj[:, 1]) <= PLATE_HALF_M
-            )
-            on_plate = float(inside.mean() * 100.0)
-        else:
-            on_plate = 0.0
+        on_plate = float(np.mean(spec.in_bounds(traj)) * 100.0) if traj.size else 0.0
         result["on_plate_pct"] = round(on_plate, 3)
         stats["per_controller"][name] = {
             **result["metrics"],
@@ -365,6 +367,7 @@ def _run_many(controllers: Sequence[str], *, steps: int, radius: float, freq: fl
         "ok": True,
         "trained": trained_registry,
         "profile": profile,
+        "example": example,
         "env": emb.to_dict() if emb.enable else None,
         "seed": seed,
         "steps": steps,
@@ -485,6 +488,9 @@ def create_app(config: Optional[Dict[str, Any]] = None) -> Flask:
             training=engine_training,
             profiles=["clean", "robust"],
             default_profile="clean",
+            examples=list_examples(),
+            example_names=example_names(),
+            default_example=RUNTIME.default_example,
             estimator="kalman",
             estimator_note="controller input is r − x̂ (Kalman estimate from position-only measurements)",
             embodiment_presets=embodiment_specs(),
@@ -514,6 +520,7 @@ def create_app(config: Optional[Dict[str, Any]] = None) -> Flask:
             spike_format = _as_spike_format(body)
             profile = _profile_from_body(body)
             embodiment = _env_from_body(body)
+            example = _example_from_body(body) or RUNTIME.default_example
 
             t0 = time.time()
             if "controllers" in body:
@@ -526,14 +533,14 @@ def create_app(config: Optional[Dict[str, Any]] = None) -> Flask:
                     list(requested), steps=steps, radius=radius, freq=freq, seed=seed,
                     record_spikes=record_spikes, spike_format=spike_format,
                     include_trace=_as_bool(body.get("include_trace"), "include_trace", True),
-                    profile=profile, embodiment=embodiment,
+                    profile=profile, embodiment=embodiment, example=example,
                 )
             else:
                 requested = body.get("controller", "pid")
                 out = _run_one(
                     requested, steps=steps, radius=radius, freq=freq, seed=seed,
                     record_spikes=record_spikes, spike_format=spike_format,
-                    profile=profile, embodiment=embodiment,
+                    profile=profile, embodiment=embodiment, example=example,
                 )
                 out["requested_controller"] = requested
                 out["engine_name"] = out["controller"]
@@ -564,12 +571,13 @@ def create_app(config: Optional[Dict[str, Any]] = None) -> Flask:
             spike_format = _as_spike_format(body)
             profile = _profile_from_body(body)
             embodiment = _env_from_body(body)
+            example = _example_from_body(body) or RUNTIME.default_example
             t0 = time.time()
             out = _run_many(
                 list(requested), steps=steps, radius=radius, freq=freq, seed=seed,
                 record_spikes=record_spikes, spike_format=spike_format,
                 include_trace=_as_bool(body.get("include_trace"), "include_trace", True),
-                profile=profile, embodiment=embodiment,
+                profile=profile, embodiment=embodiment, example=example,
             )
             out["elapsed_ms"] = round((time.time() - t0) * 1000.0, 3)
             return jsonify(out)
@@ -598,12 +606,13 @@ def create_app(config: Optional[Dict[str, Any]] = None) -> Flask:
             radius = _as_float(body.get("radius"), "radius", 0.15, 0.0, 1.0)
             freq = _as_float(body.get("freq"), "freq", 0.5, 0.0, 10.0)
             profile = _profile_from_body(body)
+            example = _example_from_body(body) or RUNTIME.default_example
             points = body.get("points")
             if points is not None and (not isinstance(points, (list, tuple)) or len(points) > MAX_POINTS):
                 raise BadRequest(f"'points' must be a list of at most {MAX_POINTS} items")
-            service = RUNTIME.service(seed, profile)
+            service = RUNTIME.service(seed, profile, None, example)
             names = [service.engine.registry.resolve(c) for c in requested]
-            cfg = BenchmarkConfig(steps=steps, radius=radius, freq=freq)
+            cfg = BenchmarkConfig(steps=steps, radius=radius, freq=freq, example=example)
             t0 = time.time()
             out = robustness_sweep(
                 lambda: {n: service.engine.build_controller(n) for n in names},
@@ -630,9 +639,10 @@ def create_app(config: Optional[Dict[str, Any]] = None) -> Flask:
             seed = _as_int(body.get("seed"), "seed", RUNTIME.default_seed, SEED_MIN, SEED_MAX)
             profile = _profile_from_body(body)
             embodiment = _env_from_body(body)
+            example = _example_from_body(body) or RUNTIME.default_example
             return jsonify(ok=True, **RUNTIME.start_training(
                 epochs=epochs, n_neurons=n_neurons, seed=seed,
-                profile=profile, embodiment=embodiment,
+                profile=profile, embodiment=embodiment, example=example,
             ))
         except BadRequest as exc:
             return jsonify(error=str(exc)), 400
@@ -656,6 +666,11 @@ def create_app(config: Optional[Dict[str, Any]] = None) -> Flask:
             radius = _as_float(body.get("radius"), "radius", 0.15, 0.0, 1.0)
             freq = _as_float(body.get("freq"), "freq", 0.5, 0.0, 10.0)
             requested = body.get("controller", "pid")
+            example = _example_from_body(body) or RUNTIME.default_example
+            if example != "ball":
+                raise BadRequest(
+                    f"MP4 export currently supports the 'ball' example only (got {example!r})"
+                )
             svc = RUNTIME.service(seed)
             engine = svc.engine
             canonical = engine.registry.resolve(requested)

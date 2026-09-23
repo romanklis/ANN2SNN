@@ -1,26 +1,23 @@
-"""State estimation: a linear Kalman filter for the ball-and-plate plant.
+"""State estimation: a linear Kalman filter for the double-integrator plants.
 
 The controller never sees the true state. The camera measures **position only**,
 
-    y_k = [x_k, y_k] + v_k,          v_k ~ N(0, R),
+    y_k = p_k + v_k,          v_k ~ N(0, R),      p in R^D
 
-and the filter reconstructs the full state
+and the filter reconstructs the full state ``x̂ = [p, ṗ]`` from the measurement
+stream and the commanded actions. This is the canonical separation between the
+true state ``x``, the observation ``y`` and the estimate ``x̂``: the policy acts
+on ``e = x̂ − r``, never on ``r − x``.
 
-    x̂ = [x, y, vx, vy]
+Nominal model (forward Euler, matching the plant step for a control gain ``G``):
 
-from the measurement stream and the commanded tilts. This is the canonical
-separation between the true state ``x``, the observation ``y`` and the estimate
-``x̂``: the policy acts on ``e = r − x̂``, not on ``r − x``.
-
-Nominal model (forward Euler, matching :func:`sim_engine.physics.step_physics`):
-
-    v_{k+1} = v_k − C·θ_k·dt
+    v_{k+1} = v_k + G·u_k·dt
     p_{k+1} = p_k + v_{k+1}·dt
 
-so ``A``/``B`` below are exact for the ideal (undamped, unit-gain, undelayed)
-plant. Damping, actuator gain/delay and other body changes are deliberately
-*unmodelled* — the filter is suboptimal there, which is the honest robustness
-signal.
+``A``/``B``/``H`` are built for any position dimension ``D`` (``D = 2`` for the
+ball-and-plate, ``D = 3`` for the drone). Damping, actuator gain/delay and other
+body changes are deliberately *unmodelled* — the filter is suboptimal there,
+which is the honest robustness signal.
 
 Sensor delay is handled properly: a measurement ``y_k`` refers to ``x_{k−d}``, so
 the filter keeps a short history of priors, applies the correction at the
@@ -39,7 +36,7 @@ __all__ = ["KalmanFilter"]
 
 
 class KalmanFilter:
-    """Linear KF for ``[x, y, vx, vy]`` from position-only measurements."""
+    """Linear KF for ``[p, ṗ]`` from position-only measurements in ``D`` dims."""
 
     name = "kalman"
     description = "Linear Kalman filter (position-only camera measurement)"
@@ -48,8 +45,9 @@ class KalmanFilter:
         self,
         dt: float = DT,
         *,
-        c_const: float = C_CONST,
-        max_tilt: float = MAX_TILT,
+        pos_dim: int = 2,
+        gain: float = -C_CONST,
+        control_limit: float = MAX_TILT,
         process_noise: float = 0.1,
         meas_noise: float = 5e-3,
         delay: int = 0,
@@ -59,62 +57,56 @@ class KalmanFilter:
         dtype=torch.float64,
     ) -> None:
         self.dt = float(dt)
-        self.c_const = float(c_const)
-        self.max_tilt = float(max_tilt)
+        self.pos_dim = int(pos_dim)
+        #: *signed* control -> acceleration gain: −C for the plate (a = −C·θ),
+        #: +1 for the drone (a = u).
+        self.gain = float(gain)
+        self.control_limit = float(control_limit)
         self.process_noise = float(process_noise)
         self.meas_noise = float(meas_noise)
         self.delay = max(0, int(delay))
         self.device = torch.device(device)
         self.dtype = dtype
 
-        dt, C = self.dt, self.c_const
-        # v' = v - C*theta*dt ; p' = p + v'*dt
-        self.A = torch.tensor(
-            [[1, 0, dt, 0],
-             [0, 1, 0, dt],
-             [0, 0, 1, 0],
-             [0, 0, 0, 1]],
-            dtype=dtype, device=self.device,
+        D, dt, G = self.pos_dim, self.dt, self.gain
+        n = 2 * D
+        eye, zero = torch.eye(D, dtype=dtype, device=self.device), torch.zeros(
+            D, D, dtype=dtype, device=self.device
         )
-        self.B = torch.tensor(
-            [[-C * dt * dt, 0],
-             [0, -C * dt * dt],
-             [-C * dt, 0],
-             [0, -C * dt]],
-            dtype=dtype, device=self.device,
-        )
-        self.H = torch.tensor(
-            [[1, 0, 0, 0],
-             [0, 1, 0, 0]],
-            dtype=dtype, device=self.device,
-        )
-        # Discrete white-noise acceleration model; per-axis [position, velocity]
-        # block for x -> indices (0, 2) and y -> indices (1, 3).
+        # v' = v + G*u*dt ; p' = p + v'*dt
+        self.A = torch.cat([
+            torch.cat([eye, dt * eye], dim=1),
+            torch.cat([zero, eye], dim=1),
+        ], dim=0)
+        self.B = torch.cat([G * dt * dt * eye, G * dt * eye], dim=0)   # (2D, D)
+        self.H = torch.cat([eye, zero], dim=1)                          # (D, 2D)
+
+        # Discrete white-noise acceleration model, one block per axis.
         q = self.process_noise ** 2
         qb = torch.tensor(
             [[dt ** 4 / 4.0, dt ** 3 / 2.0],
              [dt ** 3 / 2.0, dt ** 2.0]],
             dtype=dtype, device=self.device,
         ) * q
-        self.Q = torch.zeros(4, 4, dtype=dtype, device=self.device)
-        for pos_i, vel_i in ((0, 2), (1, 3)):
-            self.Q[pos_i, pos_i] = qb[0, 0]
-            self.Q[pos_i, vel_i] = qb[0, 1]
-            self.Q[vel_i, pos_i] = qb[1, 0]
-            self.Q[vel_i, vel_i] = qb[1, 1]
+        self.Q = torch.zeros(n, n, dtype=dtype, device=self.device)
+        for i in range(D):
+            pos_i, vel_i = i, i + D
+            self.Q[pos_i, pos_i], self.Q[pos_i, vel_i] = qb[0, 0], qb[0, 1]
+            self.Q[vel_i, pos_i], self.Q[vel_i, vel_i] = qb[1, 0], qb[1, 1]
 
-        self.R = torch.eye(2, dtype=dtype, device=self.device) * (self.meas_noise ** 2)
-        self.P0 = torch.diag(torch.tensor(
-            [init_pos_var, init_pos_var, init_vel_var, init_vel_var],
-            dtype=dtype, device=self.device,
-        ))
-        self.I4 = torch.eye(4, dtype=dtype, device=self.device)
+        self.R = torch.eye(D, dtype=dtype, device=self.device) * (self.meas_noise ** 2)
+        self.P0 = torch.diag(torch.cat([
+            torch.full((D,), init_pos_var, dtype=dtype, device=self.device),
+            torch.full((D,), init_vel_var, dtype=dtype, device=self.device),
+        ]))
+        self.I = torch.eye(n, dtype=dtype, device=self.device)
 
         self.reset()
 
     # ------------------------------------------------------------------ setup
     def reset(self, y0: Optional[torch.Tensor] = None) -> None:
-        self.x = torch.zeros(4, dtype=self.dtype, device=self.device)
+        n = 2 * self.pos_dim
+        self.x = torch.zeros(n, dtype=self.dtype, device=self.device)
         self.P = self.P0.clone()
         self._started = False
         self._step = 0
@@ -126,26 +118,28 @@ class KalmanFilter:
             self._seed_with(y0)
 
     def _seed_with(self, y: torch.Tensor) -> None:
-        y = torch.as_tensor(y, dtype=self.dtype, device=self.device).reshape(2)
-        self.x = torch.zeros(4, dtype=self.dtype, device=self.device)
-        self.x[0], self.x[1] = y[0], y[1]
+        D = self.pos_dim
+        y = torch.as_tensor(y, dtype=self.dtype, device=self.device).reshape(D)
+        self.x = torch.zeros(2 * D, dtype=self.dtype, device=self.device)
+        self.x[:D] = y
         self.P = self.P0.clone()
 
     # ----------------------------------------------------------------- update
     def update(self, y: torch.Tensor, u_prev: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Fold in the (possibly delayed) measurement ``y`` and return ``x̂``."""
-        y = torch.as_tensor(y, dtype=self.dtype, device=self.device).reshape(2)
+        D = self.pos_dim
+        y = torch.as_tensor(y, dtype=self.dtype, device=self.device).reshape(D)
         if not self._started:
             self._seed_with(y)
             self._started = True
             self._px.append(self.x.clone())
             self._pP.append(self.P.clone())
-            self._cmds.append(torch.zeros(2, dtype=self.dtype, device=self.device))
+            self._cmds.append(torch.zeros(D, dtype=self.dtype, device=self.device))
             return self.x.clone()
 
-        u = torch.zeros(2, dtype=self.dtype, device=self.device)
+        u = torch.zeros(D, dtype=self.dtype, device=self.device)
         if u_prev is not None:
-            u = torch.as_tensor(u_prev, dtype=self.dtype, device=self.device).reshape(2)
+            u = torch.as_tensor(u_prev, dtype=self.dtype, device=self.device).reshape(D)
 
         # predict current step
         x_pred = self.A @ self.x + self.B @ u
@@ -173,7 +167,7 @@ class KalmanFilter:
         S = self.H @ P_pred @ self.H.T + self.R
         K = P_pred @ self.H.T @ torch.linalg.inv(S)
         x = x_pred + K @ (y - self.H @ x_pred)
-        P = (self.I4 - K @ self.H) @ P_pred
+        P = (self.I - K @ self.H) @ P_pred
         return x, P
 
     # -------------------------------------------------------------- reporting
@@ -181,9 +175,11 @@ class KalmanFilter:
         return {
             "name": self.name,
             "description": self.description,
+            "pos_dim": self.pos_dim,
             "dt": self.dt,
+            "gain": self.gain,
             "process_noise": self.process_noise,
             "meas_noise": self.meas_noise,
             "delay": self.delay,
-            "measurement": "position-only [x, y]",
+            "measurement": f"position-only [{', '.join('xyz'[:self.pos_dim])}]",
         }

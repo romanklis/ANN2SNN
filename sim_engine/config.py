@@ -21,6 +21,7 @@ from .physics import (
 
 __all__ = [
     "DEFAULT_STEPS",
+    "DEFAULT_EXAMPLE",
     "PlantConfig",
     "NetworkConfig",
     "EmbodimentConfig",
@@ -31,6 +32,10 @@ __all__ = [
 
 #: Canonical closed-loop horizon: 500 control frames at ``DT = 0.02`` (50 Hz) = 10 s.
 DEFAULT_STEPS: int = 500
+
+#: Which example to simulate by default ("ball" | "drone").  Kept as a literal so
+#: this module never imports :mod:`sim_engine.examples` (which imports it).
+DEFAULT_EXAMPLE: str = "ball"
 
 
 def _default_init_state() -> Tuple[float, float, float, float]:
@@ -173,9 +178,10 @@ class BenchmarkConfig:
     """Closed-loop trajectory-evaluation parameters."""
 
     steps: int = DEFAULT_STEPS
-    radius: float = 0.15
-    freq: float = 0.5
+    radius: Optional[float] = None
+    freq: Optional[float] = None
     record_spikes: bool = True
+    example: str = DEFAULT_EXAMPLE
     embodiment: EmbodimentConfig = field(default_factory=EmbodimentConfig)
 
     def to_dict(self) -> dict:
@@ -246,6 +252,7 @@ class EngineConfig:
     radius: Optional[float] = None
     freq: Optional[float] = None
     record_spikes: Optional[bool] = None
+    example: Optional[str] = None
     micro_steps: Optional[int] = None
     n_neurons: Optional[int] = None
     synapses_per_neuron: Optional[int] = None
@@ -277,6 +284,16 @@ class EngineConfig:
             b.freq = float(self.freq)
         if self.record_spikes is not None:
             b.record_spikes = bool(self.record_spikes)
+        if self.example is not None:
+            b.example = str(self.example)
+        # size the network (policy input/output widths) for the active example
+        from .examples import get_example  # local import breaks the config↔examples cycle
+
+        spec = get_example(b.example)
+        n.n_in = spec.n_in
+        n.n_out = spec.n_out
+        if self.init_state is None:
+            p.init_state = spec.init_state
         if self.micro_steps is not None:
             n.micro_steps = int(self.micro_steps)
         if self.n_neurons is not None:

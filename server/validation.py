@@ -155,3 +155,16 @@ def _profile_from_body(body: Dict[str, Any]) -> str:
     if profile not in {"clean", "robust"}:
         raise BadRequest("'profile' must be 'clean' or 'robust'")
     return profile
+
+
+def _example_from_body(body: Dict[str, Any]) -> Optional[str]:
+    """Parse/validate the requested example, or ``None`` when not specified."""
+    raw = body.get("example")
+    if raw is None:
+        return None
+    from sim_engine.examples import example_names
+
+    name = str(raw).strip().lower()
+    if name not in example_names():
+        raise BadRequest(f"'example' must be one of: {', '.join(example_names())}")
+    return name

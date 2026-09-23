@@ -19,7 +19,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from ..physics import N_IN, N_NEURONS, N_OUT, MAX_TILT, clamp_action
+from ..physics import C_CONST, MAX_TILT, N_IN, N_NEURONS, N_OUT
 from .base import BaseController
 
 __all__ = ["DenseNNController"]
@@ -43,9 +43,14 @@ class DenseNNController(nn.Module, BaseController):
         device="cpu",
         dtype=torch.float32,
         seed: int | None = None,
+        plant_gain: float = -C_CONST,
+        pos_dim: int | None = None,
     ) -> None:
         nn.Module.__init__(self)
-        BaseController.__init__(self, n_in=n_in, n_out=n_out, device=device)
+        BaseController.__init__(
+            self, n_in=n_in, n_out=n_out, device=device,
+            action_limit=max_tilt, plant_gain=plant_gain, pos_dim=pos_dim,
+        )
         self.n_neurons = n_neurons
         self.max_tilt = max_tilt
 
@@ -68,7 +73,7 @@ class DenseNNController(nn.Module, BaseController):
     # nn.Module machinery --------------------------------------------------- #
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Saturated actuator command for a batch ``x`` of policy inputs."""
-        return clamp_action(self.net(x), self.max_tilt)
+        return torch.clamp(self.net(x), -self.action_limit, self.action_limit)
 
     # BaseController machinery --------------------------------------------- #
     def reset(self) -> None:

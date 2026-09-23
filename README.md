@@ -41,6 +41,38 @@ step is an **offline model conversion**; both policies are then dropped into the
 
 ---
 
+## Examples — swappable plant + task
+
+The same engine drives more than one **example**; everything plant-specific
+(step, reference, estimator model, metric, bounds, labels) is pluggable, while the
+controller contract, distillation, ANN→SNN transfer, sessions and API stay shared.
+
+| Example | Plant | Command | Task |
+|---|---|---|---|
+| **Balancing ball** (`ball`, default) | ball rolling on a tilting plate | plate tilt `[θx, θy]` rad | track a circular orbit |
+| **Hovering drone** (`drone`) | 3-D point mass | thrust `[ax, ay, az]` m/s² | lissajous flight path or hover |
+
+```bash
+python -m sim_engine benchmark --example drone --steps 500
+python -m sim_engine train --example drone --profile robust --save weights_drone.pt
+```
+
+```python
+engine = Engine(EngineConfig(example="drone", train_on_init=True))
+report = engine.run_benchmark(["pid", "flylike_ann", "snn_transferred"])
+```
+
+HTTP: `POST /api/benchmark {"example": "drone", ...}`; the example catalogue is in
+`GET /api/controllers` (`examples`, `example_names`, `default_example`) and weights
+are cached per `(example, profile, seed)`. Adding a new example is one module plus
+`register_example(...)` — see [`docs/EXAMPLES.md`](docs/EXAMPLES.md).
+
+The dashboard's **EXAMPLE** selector switches the stage between the isometric
+plate view and the 3-D corridor flight view and relabels every panel from the
+catalogue (`PLATE TILT [rad]` vs `THRUST [m/s²]`, `ON PLATE` vs `IN CORRIDOR`).
+
+---
+
 ## The closed loop
 
 ```

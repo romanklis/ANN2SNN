@@ -62,6 +62,52 @@ def test_controllers_payload(client):
     assert body["plate_half"] == pytest.approx(0.25)
 
 
+def test_controllers_expose_examples(client):
+    """The example catalogue ships plant/task dims, labels, bounds, renderer."""
+    body = client.get("/api/controllers").get_json()
+    assert body["example_names"] == ["ball", "drone"]
+    assert body["default_example"] == "ball"
+
+    examples = {e["name"]: e for e in body["examples"]}
+    ball, drone = examples["ball"], examples["drone"]
+    assert (ball["pos_dim"], ball["n_in"], ball["n_out"], ball["renderer"]) == (2, 6, 2, "plate")
+    assert ball["labels"]["success"] == "ON PLATE"
+    assert (drone["pos_dim"], drone["n_in"], drone["n_out"], drone["renderer"]) == (3, 9, 3, "quad")
+    assert drone["labels"]["success"] == "IN CORRIDOR"
+    assert drone["units"]["command"] == "m/s²"
+    assert len(drone["bounds_high"]) == 3
+    assert drone["bounds_high"][0] == pytest.approx(1.0)
+    assert drone["defaults"]["radius"] > ball["defaults"]["radius"]
+
+
+def test_benchmark_accepts_drone_example(client, monkeypatch):
+    """The same controller pipeline runs on the 3-D example over HTTP."""
+    # skip the first-use distillation: the PD controller needs no weights
+    monkeypatch.setattr(RUNTIME, "auto_train", False)
+    RUNTIME._engines.clear()
+    try:
+        r = client.post("/api/benchmark", json={
+            "example": "drone", "controllers": ["pid"], "steps": 40,
+            "seed": 42, "embodiment": "clean",
+        })
+        assert r.status_code == 200
+        body = r.get_json()
+        assert body["stats"]["example"] == "drone"
+        assert len(body["stats"]["bounds_high"]) == 3
+        err = body["stats"]["per_controller"]["pid"]["mean_error_cm"]
+        assert err >= 0.0
+    finally:
+        RUNTIME._engines.clear()
+
+
+def test_benchmark_rejects_unknown_example(client):
+    r = client.post("/api/benchmark", json={
+        "example": "helicopter", "controllers": ["pid"], "steps": 10,
+    })
+    assert r.status_code == 400
+    assert "example" in r.get_json()["error"]
+
+
 def test_model_guide_and_training_metadata(client):
     """Every model carries provenance: how obtained, value, how trained."""
     catalog = {c["name"]: c for c in client.get("/api/controllers").get_json()["catalog"]}

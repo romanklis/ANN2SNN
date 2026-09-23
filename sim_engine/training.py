@@ -34,6 +34,7 @@ from .controllers import ClassicalPDController, ConnectomeANNController, DenseNN
 from .controllers.base import ReferenceAccelEstimator, error_vector
 from .environment import EmbodiedEnv
 from .estimators import KalmanFilter
+from .examples import get_example
 from .physics import MAX_TILT, N_IN, SYNAPSES_PER_NEURON
 from .reference import orbit_reference
 
@@ -85,10 +86,11 @@ def sample_policy_inputs(
     last two are a uniform feed-forward command in ``[-ff_scale, +ff_scale]`` so
     training covers both channels.
     """
-    errs = sample_errors(batch_size, error_scale, min(n_in, 4), device, dtype)
-    if n_in <= 4:
-        return errs
-    ff = (torch.rand(batch_size, n_in - 4, device=device, dtype=dtype) * 2.0 - 1.0) * ff_scale
+    errs = sample_errors(batch_size, error_scale, max(2 * (n_in // 3), 4), device, dtype)
+    extra = n_in - errs.shape[1]
+    if extra <= 0:
+        return errs[:, :n_in]
+    ff = (torch.rand(batch_size, extra, device=device, dtype=dtype) * 2.0 - 1.0) * ff_scale
     return torch.cat([errs, ff], dim=1)
 
 
@@ -97,18 +99,19 @@ def pd_target(
     inputs: torch.Tensor,
     teacher: ClassicalPDController,
 ) -> torch.Tensor:
-    """PD label for a batch of policy inputs: ``(B, 2)`` saturated commands.
+    """PD label for a batch of policy inputs ``(B, D)`` (``D = teacher.pos_dim``).
 
-    Matches the analytic teacher exactly: ``kp*e + kd*ė + u_ff`` (the feed-forward
-    columns are the reconstructed reference acceleration command).
+    Matches the analytic teacher exactly: ``kp*e + kd*ė + u_ff`` per axis (the
+    feed-forward columns are the reconstructed reference acceleration command).
     """
-    kp, kd = teacher.kp, teacher.kd
-    tx = kp * inputs[:, 0] + kd * inputs[:, 2]
-    ty = kp * inputs[:, 1] + kd * inputs[:, 3]
-    if inputs.shape[1] >= 6:
-        tx = tx + inputs[:, 4]
-        ty = ty + inputs[:, 5]
-    return torch.stack([tx, ty], dim=1).clamp(-teacher.max_tilt, teacher.max_tilt)
+    d = int(teacher.pos_dim)
+    g = teacher.plant_gain
+    # label = (−ω²·e − 2ζω·ė)/G + u_ff  (corrective feedback for the signed gain)
+    cmd = -(teacher.omega_n ** 2 / g) * inputs[:, :d] \
+        - (2.0 * teacher.zeta * teacher.omega_n / g) * inputs[:, d:2 * d]
+    if inputs.shape[1] >= 3 * d:
+        cmd = cmd + inputs[:, 2 * d:3 * d]
+    return cmd.clamp(-teacher.action_limit, teacher.action_limit)
 
 
 def train_dense_controller(
@@ -131,12 +134,15 @@ def train_dense_controller(
 
     controller.train()
     for epoch in range(1, config.epochs + 1):
-        inputs = sample_policy_inputs(config.batch_size, config.error_scale, controller.n_in, device, dtype)
+        inputs = sample_policy_inputs(
+            config.batch_size, config.error_scale, controller.n_in, device, dtype,
+            ff_scale=controller.action_limit,
+        )
         targets = pd_target(inputs, teacher)
 
         opt.zero_grad()
         pred = controller.net(inputs)  # unsaturated head; loss sees the raw output
-        loss = criterion(pred.clamp(-controller.max_tilt, controller.max_tilt), targets)
+        loss = criterion(pred.clamp(-controller.action_limit, controller.action_limit), targets)
         loss.backward()
         opt.step()
 
@@ -167,7 +173,10 @@ def train_connectome_controller(
 
     controller.train()
     for epoch in range(1, config.epochs + 1):
-        errs = sample_policy_inputs(config.batch_size, config.error_scale, controller.n_in, device, dtype)
+        errs = sample_policy_inputs(
+            config.batch_size, config.error_scale, controller.n_in, device, dtype,
+            ff_scale=controller.action_limit,
+        )
         targets = pd_target(errs, teacher)
 
         opt.zero_grad()
@@ -176,7 +185,7 @@ def train_connectome_controller(
         for _ in range(config.connectome_unroll):
             recurrent_drive = torch.sparse.mm(w_sparse, h.T).T
             h = controller.relu(controller.w_in(errs) + recurrent_drive)
-        pred = controller.w_out(h).clamp(-controller.max_tilt, controller.max_tilt)
+        pred = controller.w_out(h).clamp(-controller.action_limit, controller.action_limit)
 
         loss = criterion(pred, targets)
         loss.backward()
@@ -189,6 +198,38 @@ def train_connectome_controller(
     return {"loss": history, "final_loss": history[-1] if history else float("nan")}
 
 
+def _student_factories(spec, network: NetworkConfig, device: str, seed: int,
+                       dense=None, connectome=None):
+    """Build dense/connectome students sized and configured for ``spec``."""
+    if dense is None:
+        dense = DenseNNController(
+            n_in=spec.n_in, n_neurons=network.n_neurons, n_out=spec.n_out,
+            device=device, seed=seed,
+            plant_gain=spec.plant_gain, pos_dim=spec.pos_dim,
+            max_tilt=spec.control_limit,
+        )
+    if connectome is None:
+        connectome = ConnectomeANNController(
+            n_in=spec.n_in, n_neurons=network.n_neurons, n_out=spec.n_out,
+            synapses_per_neuron=network.synapses_per_neuron,
+            inhibitory_fraction=network.inhibitory_fraction,
+            excitatory_weight=network.excitatory_weight,
+            inhibitory_weight=network.inhibitory_weight,
+            seed=seed, device=device,
+            plant_gain=spec.plant_gain, pos_dim=spec.pos_dim,
+            max_tilt=spec.control_limit,
+        )
+    return dense, connectome
+
+
+def _teacher_for(spec, device: str, *, use_feedforward: bool = True) -> ClassicalPDController:
+    """The analytic teacher, dimensioned and signed for ``spec``."""
+    return ClassicalPDController(
+        device=device, pos_dim=spec.pos_dim, plant_gain=spec.plant_gain,
+        action_limit=spec.control_limit, use_feedforward=use_feedforward,
+    )
+
+
 def distill(
     network: Optional[NetworkConfig] = None,
     config: Optional[TrainingConfig] = None,
@@ -196,6 +237,7 @@ def distill(
     seed: Optional[int] = None,
     dense: Optional[DenseNNController] = None,
     connectome: Optional[ConnectomeANNController] = None,
+    example: Optional[str] = None,
     log_fn=None,
 ) -> Dict[str, object]:
     """Train *both* students and return them with their loss histories.
@@ -204,34 +246,20 @@ def distill(
     -------
     dict with keys ``dense``, ``connectome``, ``history``, ``config``.
     """
-    network = network or NetworkConfig()
+    spec = get_example(example)
+    network = dataclasses.replace(
+        network or NetworkConfig(), n_in=spec.n_in, n_out=spec.n_out
+    )
     config = config or TrainingConfig()
     if seed is not None:
         config = dataclasses.replace(config, seed=seed)
 
     device = config.device
-    if dense is None:
-        dense = DenseNNController(
-            n_in=network.n_in,
-            n_neurons=network.n_neurons,
-            n_out=network.n_out,
-            device=device,
-            seed=config.seed,
-        )
-    if connectome is None:
-        connectome = ConnectomeANNController(
-            n_in=network.n_in,
-            n_neurons=network.n_neurons,
-            n_out=network.n_out,
-            synapses_per_neuron=network.synapses_per_neuron,
-            inhibitory_fraction=network.inhibitory_fraction,
-            excitatory_weight=network.excitatory_weight,
-            inhibitory_weight=network.inhibitory_weight,
-            seed=config.seed,
-            device=device,
-        )
+    dense, connectome = _student_factories(
+        spec, network, device, config.seed, dense=dense, connectome=connectome
+    )
 
-    teacher = ClassicalPDController(device=device)
+    teacher = _teacher_for(spec, device)
     dense_hist = train_dense_controller(dense, teacher, config, log_fn=log_fn)
     conn_hist = train_connectome_controller(connectome, teacher, config, log_fn=log_fn)
 
@@ -268,31 +296,24 @@ def generate_closed_loop_episodes(
     ``labels`` ``(E, 2)``.
     """
     benchmark = benchmark or BenchmarkConfig(steps=int(config.episode_steps))
+    spec = get_example(benchmark.example)
     if embodiment is None:
         embodiment = config.embodiment or EmbodimentConfig.from_preset(
             "embodied" if config.profile == "robust" else "clean"
         )
     steps = int(config.episode_steps)
-    ref = orbit_reference(steps=steps, radius=benchmark.radius, freq=benchmark.freq)
-    env = EmbodiedEnv(embodiment, dt=ref.dt, max_tilt=MAX_TILT, device=config.device)
-    kf = KalmanFilter(
-        dt=ref.dt,
-        process_noise=embodiment.estimate_process_noise,
-        meas_noise=max(float(embodiment.sensor_noise_pos), 1e-4),
-        delay=env.sensor_delay,
-        init_pos_var=embodiment.estimate_init_pos_var,
-        init_vel_var=embodiment.estimate_init_vel_var,
-        device=config.device,
-    )
+    ref = spec.reference(steps=steps, radius=benchmark.radius, freq=benchmark.freq)
+    env = spec.make_env(embodiment, dt=ref.dt, device=config.device)
+    kf = spec.make_estimator(embodiment, dt=ref.dt, device=config.device)
 
     episodes = []
-    ff_est = ReferenceAccelEstimator(dt=ref.dt)
+    ff_est = ReferenceAccelEstimator(dt=ref.dt, plant_gain=spec.plant_gain, pos_dim=spec.pos_dim)
     for ep in range(int(config.episodes)):
         env.reset(seed=int(config.seed) + ep)
         kf.reset()
         ff_est.reset()
-        state = torch.tensor([-0.05, 0.05, 0.0, 0.0], dtype=torch.float32, device=config.device)
-        u_prev = torch.zeros(2, dtype=torch.float32, device=config.device)
+        state = torch.tensor(spec.init_state, dtype=torch.float32, device=config.device)
+        u_prev = torch.zeros(spec.control_dim, dtype=torch.float32, device=config.device)
         inputs, labels = [], []
         with torch.no_grad():
             for k in range(steps):
@@ -424,6 +445,7 @@ def distill_embodied(
     dense: Optional[DenseNNController] = None,
     connectome: Optional[ConnectomeANNController] = None,
     benchmark: Optional[BenchmarkConfig] = None,
+    example: Optional[str] = None,
     log_fn=None,
 ) -> Dict[str, object]:
     """Robust profile: distil both students from the embodied closed-loop teacher."""
@@ -432,7 +454,8 @@ def distill_embodied(
         config = dataclasses.replace(config, profile="robust")
     return distill_closed_loop(
         "robust", network, config,
-        dense=dense, connectome=connectome, benchmark=benchmark, log_fn=log_fn,
+        dense=dense, connectome=connectome, benchmark=benchmark,
+        example=example, log_fn=log_fn,
     )
 
 
@@ -444,6 +467,7 @@ def distill_closed_loop(
     dense: Optional[DenseNNController] = None,
     connectome: Optional[ConnectomeANNController] = None,
     benchmark: Optional[BenchmarkConfig] = None,
+    example: Optional[str] = None,
     log_fn=None,
 ) -> Dict[str, object]:
     """Distil π(r − x̂) from closed-loop teacher rollouts through the Kalman filter.
@@ -452,30 +476,22 @@ def distill_closed_loop(
     noise, no delay, no disturbances) but still estimates velocity from
     position-only measurements; ``robust`` runs the embodied environment.
     """
-    network = network or NetworkConfig()
+    spec = get_example(example or (benchmark.example if benchmark else None))
+    network = dataclasses.replace(
+        network or NetworkConfig(), n_in=spec.n_in, n_out=spec.n_out
+    )
     config = config or TrainingConfig(profile=profile)
     if config.profile != profile:
         config = dataclasses.replace(config, profile=profile)
     profile = config.profile
 
     device = config.device
-    if dense is None:
-        dense = DenseNNController(
-            n_in=network.n_in, n_neurons=network.n_neurons,
-            n_out=network.n_out, device=device, seed=config.seed,
-        )
-    if connectome is None:
-        connectome = ConnectomeANNController(
-            n_in=network.n_in, n_neurons=network.n_neurons, n_out=network.n_out,
-            synapses_per_neuron=network.synapses_per_neuron,
-            inhibitory_fraction=network.inhibitory_fraction,
-            excitatory_weight=network.excitatory_weight,
-            inhibitory_weight=network.inhibitory_weight,
-            seed=config.seed, device=device,
-        )
+    dense, connectome = _student_factories(
+        spec, network, device, config.seed, dense=dense, connectome=connectome
+    )
 
     setup = EmbodimentConfig.from_preset("embodied" if profile == "robust" else "clean")
-    teacher = ClassicalPDController(device=device)
+    teacher = _teacher_for(spec, device)
     episodes = generate_closed_loop_episodes(
         teacher, config, benchmark,
         embodiment=config.embodiment or setup,
@@ -490,6 +506,7 @@ def distill_closed_loop(
         extra = sample_policy_inputs(
             int(config.coverage_samples), config.error_scale,
             network.n_in, device, next(dense.parameters()).dtype,
+            ff_scale=spec.control_limit,
         )
         episodes.append({"inputs": extra, "labels": pd_target(extra, teacher)})
 
@@ -518,6 +535,7 @@ def distill_profile(
     dense: Optional[DenseNNController] = None,
     connectome: Optional[ConnectomeANNController] = None,
     benchmark: Optional[BenchmarkConfig] = None,
+    example: Optional[str] = None,
     log_fn=None,
 ) -> Dict[str, object]:
     """Distil the closed-loop teacher for the requested profile (clean or robust)."""
@@ -526,7 +544,8 @@ def distill_profile(
         config = dataclasses.replace(config, profile=profile)
     return distill_closed_loop(
         config.profile, network, config,
-        dense=dense, connectome=connectome, benchmark=benchmark, log_fn=log_fn,
+        dense=dense, connectome=connectome, benchmark=benchmark,
+        example=example, log_fn=log_fn,
     )
 
 

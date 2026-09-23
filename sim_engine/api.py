@@ -27,6 +27,7 @@ from .config import (
     PlantConfig,
     TrainingConfig,
 )
+from .examples import get_example, list_examples
 from .engine import Engine, SimulationSession
 from .registry import ALIASES, CANONICAL_CONTROLLERS, LABELS, normalize_name
 from .serialization import to_jsonable
@@ -76,6 +77,15 @@ def config_from_dict(data: Optional[dict] = None) -> EngineConfig:
     if "epochs" in data and data["epochs"] is not None:
         cfg.training.epochs = int(data["epochs"])
 
+    # Example (ball / drone / …): selects plant, task, dims, bounds, metric.
+    if "example" in data and data["example"] is not None:
+        spec = get_example(str(data["example"]))
+        cfg.benchmark.example = spec.name
+        cfg.network.n_in = spec.n_in
+        cfg.network.n_out = spec.n_out
+        if "init_state" not in data or data["init_state"] is None:
+            cfg.plant.init_state = spec.init_state
+
     # Embodiment: a preset name, a partial dict, or flat convenience keys.
     if "embodiment" in data and data["embodiment"] is not None:
         val = data["embodiment"]
@@ -89,7 +99,6 @@ def config_from_dict(data: Optional[dict] = None) -> EngineConfig:
         cfg.benchmark.embodiment = EmbodimentConfig.from_preset(data["embodiment_preset"])
     flat_emb = {
         "sensor_noise_pos": "sensor_noise_pos",
-        "sensor_noise_vel": "sensor_noise_vel",
         "sensor_delay": "sensor_delay",
         "actuator_delay": "actuator_delay",
         "disturbance_std": "process_noise",

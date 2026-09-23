@@ -29,6 +29,7 @@ from typing import List, Optional
 from .api import build_engine, config_from_dict, list_controllers
 from .config import EMBODIMENT_PRESETS
 from .engine import Engine
+from .examples import example_names
 from .physics import DT
 from .registry import CANONICAL_CONTROLLERS
 
@@ -48,6 +49,10 @@ def _add_engine_args(p: argparse.ArgumentParser) -> None:
         "--embodiment", default=None, choices=sorted(EMBODIMENT_PRESETS),
         help="embodied environment preset (default: clean)",
     )
+    p.add_argument(
+        "--example", default=None, choices=example_names(),
+        help="which example to simulate: 'ball' (default) or 'drone'",
+    )
 
 
 def _engine_from_args(args) -> Engine:
@@ -64,6 +69,8 @@ def _engine_from_args(args) -> Engine:
     }
     if getattr(args, "embodiment", None):
         cfg["embodiment_preset"] = args.embodiment
+    if getattr(args, "example", None):
+        cfg["example"] = args.example
     return build_engine(cfg, train=bool(getattr(args, "train", False)))
 
 
@@ -172,9 +179,11 @@ def cmd_train(args) -> int:
         args.profile,
         net,
         cfg,
-        benchmark=BenchmarkConfig(steps=args.episode_steps),
+        benchmark=BenchmarkConfig(steps=args.episode_steps, example=args.example),
+        example=args.example,
         log_fn=lambda w, e, l: print(f"[train:{w}] epoch {e:03d} | loss {l:.6f}"),
     )
+    print(f"example               : {args.example}")
     print(f"profile               : {args.profile}")
     print(f"final dense loss      : {result['final_loss']['dense']:.6f}")
     print(f"final connectome loss : {result['final_loss']['connectome']:.6f}")
@@ -289,6 +298,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--log-every", type=int, default=25)
     sp.add_argument("--profile", default="clean", choices=["clean", "robust"],
                     help="clean i.i.d. distillation or robust embodied distillation")
+    sp.add_argument("--example", default="ball", choices=example_names(),
+                    help="which example to distil for")
     sp.add_argument("--embodiment", default=None, choices=sorted(EMBODIMENT_PRESETS),
                     help="embodiment preset for the robust profile (default: embodied)")
     sp.add_argument("--episodes", type=int, default=4, help="robust: teacher episodes")

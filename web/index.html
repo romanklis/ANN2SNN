@@ -26,6 +26,10 @@
         <span class="pill pill-idle" id="api-pill">connecting…</span>
         <span class="pill pill-idle" id="trained-pill">untrained</span>
         <label class="env">
+          <span class="env-label">EXAMPLE</span>
+          <select id="example-select" title="Which example to simulate" disabled></select>
+        </label>
+        <label class="env">
           <span class="env-label">ENV</span>
           <select id="env-select" title="Body / environment preset" disabled></select>
         </label>
@@ -61,7 +65,7 @@
             <div class="pipe-row node-plant">
               <span class="pr-rule"></span>
               <span class="pr-label">PLANT</span>
-              <span class="pr-value">BALL + PLATE</span>
+              <span class="pr-value" id="pipe-plant">BALL + PLATE</span>
             </div>
             <div class="pipe-row node-camera">
               <span class="pr-rule"></span>
@@ -73,7 +77,7 @@
             <div class="pipe-row node-kalman">
               <span class="pr-rule"></span>
               <span class="pr-label">KALMAN</span>
-              <span class="pr-value">x̂ = [x, y, vx, vy]
+              <span class="pr-value" id="pipe-kalman">x̂ = [x, y, vx, vy]
                 <span class="pr-sub">delay-aware state estimate</span>
               </span>
             </div>
@@ -98,13 +102,13 @@
 
         <!-- Control output ----------------------------------------------- -->
         <section class="panel panel-control">
-          <h2>Control output · plate tilt <span class="unit">[rad]</span></h2>
+          <h2 id="control-title">Control output · plate tilt <span class="unit">[rad]</span></h2>
           <div class="canvas-wrap"><canvas id="control-out"></canvas></div>
         </section>
 
         <!-- Tracking ------------------------------------------------------ -->
         <section class="panel panel-tracking">
-          <h2>Tracking · radial error <span class="unit">[cm]</span></h2>
+          <h2 id="tracking-title">Tracking · radial error <span class="unit">[cm]</span></h2>
           <div class="canvas-wrap"><canvas id="tracking"></canvas></div>
         </section>
       </aside>

@@ -29,6 +29,7 @@ from .controllers import (
     DenseNNController,
     LosslessConnectomeSNN,
 )
+from .physics import C_CONST, MAX_TILT
 
 __all__ = ["ControllerRegistry", "CANONICAL_CONTROLLERS", "EXTRA_CONTROLLERS",
            "ALIASES", "normalize_name"]
@@ -101,12 +102,18 @@ class ControllerRegistry:
         connectome: Optional[ConnectomeANNController] = None,
         micro_steps: int = 10,
         trained: bool = False,
+        action_limit: float = MAX_TILT,
+        plant_gain: float = -C_CONST,
+        pos_dim: Optional[int] = None,
     ) -> None:
         self.network = network or NetworkConfig()
         self.device = device
         self.seed = seed
         self.micro_steps = micro_steps
         self.trained = trained
+        self.action_limit = float(action_limit)
+        self.plant_gain = float(plant_gain)
+        self.pos_dim = int(pos_dim) if pos_dim is not None else int(self.network.n_out)
 
         self.dense = dense or DenseNNController(
             n_in=self.network.n_in,
@@ -114,6 +121,9 @@ class ControllerRegistry:
             n_out=self.network.n_out,
             device=device,
             seed=seed,
+            plant_gain=self.plant_gain,
+            pos_dim=self.pos_dim,
+            max_tilt=self.action_limit,
         )
         self.connectome = connectome or ConnectomeANNController(
             n_in=self.network.n_in,
@@ -125,8 +135,14 @@ class ControllerRegistry:
             inhibitory_weight=self.network.inhibitory_weight,
             seed=seed,
             device=device,
+            plant_gain=self.plant_gain,
+            pos_dim=self.pos_dim,
+            max_tilt=self.action_limit,
         )
-        self.teacher = ClassicalPDController(device=device)
+        self.teacher = ClassicalPDController(
+            device=device, pos_dim=self.pos_dim, plant_gain=self.plant_gain,
+            action_limit=self.action_limit,
+        )
 
     # -- introspection ------------------------------------------------------ #
     def names(self) -> List[str]:
@@ -166,10 +182,16 @@ class ControllerRegistry:
         canonical = self.resolve(name)
 
         if canonical == "pid":
-            return ClassicalPDController(device=self.device)
+            return ClassicalPDController(
+                device=self.device, pos_dim=self.pos_dim,
+                plant_gain=self.plant_gain, action_limit=self.action_limit,
+            )
 
         if canonical == "pid_no_ff":
-            return ClassicalPDController(use_feedforward=False, device=self.device)
+            return ClassicalPDController(
+                use_feedforward=False, device=self.device, pos_dim=self.pos_dim,
+                plant_gain=self.plant_gain, action_limit=self.action_limit,
+            )
 
         if canonical == "random_ann":
             # Deterministic but distinct from the distilled model: offset seed.
@@ -179,6 +201,9 @@ class ControllerRegistry:
                 n_out=self.network.n_out,
                 device=self.device,
                 seed=self.seed + 1000,
+                plant_gain=self.plant_gain,
+                pos_dim=self.pos_dim,
+                max_tilt=self.action_limit,
             )
 
         if canonical == "dense_ann":
@@ -195,6 +220,9 @@ class ControllerRegistry:
                 n_out=self.network.n_out,
                 device=self.device,
                 seed=self.seed,
+                plant_gain=self.plant_gain,
+                pos_dim=self.pos_dim,
+                max_tilt=self.action_limit,
             )
 
         if canonical == "flylike_ann":
@@ -205,6 +233,9 @@ class ControllerRegistry:
                 self.connectome,
                 micro_steps=self.micro_steps,
                 device=self.device,
+                plant_gain=self.plant_gain,
+                pos_dim=self.pos_dim,
+                max_tilt=self.action_limit,
             )
 
         raise KeyError(canonical)  # pragma: no cover - guarded by resolve()

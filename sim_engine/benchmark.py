@@ -26,7 +26,8 @@ from .config import BenchmarkConfig
 from .controllers.base import BaseController
 from .environment import EmbodiedEnv
 from .estimators import KalmanFilter
-from .physics import DT, PLATE_HALF, step_physics
+from .examples import get_example
+from .physics import DT, step_physics
 from .reference import Reference, orbit_reference
 from .serialization import to_jsonable
 
@@ -154,10 +155,11 @@ def mean_radial_error_cm(
     trajectory: np.ndarray,
     reference: Reference,
 ) -> np.ndarray:
-    """Instantaneous radial tracking error ``|p - p_ref|`` in centimetres."""
+    """Instantaneous tracking error ``‖p - p_ref‖`` in centimetres (any dim)."""
+    d = int(reference.pos.shape[1])
     T = min(len(trajectory), len(reference))
-    ref = reference.pos.cpu().numpy()[:T]
-    return np.sqrt(np.sum((trajectory[:T, :2] - ref) ** 2, axis=1)) * 100.0
+    ref = reference.pos.cpu().numpy()[:T, :d]
+    return np.sqrt(np.sum((trajectory[:T, :d] - ref) ** 2, axis=1)) * 100.0
 
 
 def run_closed_loop(
@@ -170,26 +172,30 @@ def run_closed_loop(
     name: Optional[str] = None,
     env: Optional[EmbodiedEnv] = None,
     estimator: Optional[KalmanFilter] = None,
+    example: Optional[str] = None,
 ) -> TrajectoryResult:
     """Roll the plant + controller forward over the whole reference trajectory.
 
-    When ``env`` is given the controller only sees ``env.observe(state)`` and its
+    When ``env`` is given the controller only sees ``env.measure(state)`` and its
     command passes through ``env.actuate`` / ``env.step``; the recorded
-    ``trajectory`` is always the **true** plant state.  With ``env=None`` the
-    original clean loop runs unchanged.
+    ``trajectory`` is always the **true** plant state.  With ``env=None`` an
+    idealized (no sensing/no actuator) loop runs, used by unit tests.
+
+    ``example`` selects the task family (``ball``/``drone``) for the default
+    reference, initial state and error metric.
     """
     config = config or BenchmarkConfig()
+    spec = get_example(example or config.example)
     if reference is None:
-        reference = orbit_reference(
-            steps=config.steps, radius=config.radius, freq=config.freq
-        )
+        reference = spec.reference(steps=config.steps, radius=config.radius,
+                                   freq=config.freq)
     steps = min(config.steps, len(reference))
     if record_spikes is None:
         record_spikes = config.record_spikes
 
     device = getattr(controller, "device", torch.device("cpu"))
     if init_state is None:
-        init_state = torch.tensor([-0.05, 0.05, 0.0, 0.0], device=device)
+        init_state = torch.tensor(spec.init_state, device=device)
     state = torch.as_tensor(init_state, dtype=torch.float32, device=device).clone()
 
     use_env = env is not None
@@ -198,6 +204,9 @@ def run_closed_loop(
         env.reset()
         kf = estimator or KalmanFilter(
             dt=reference.dt,
+            pos_dim=env.pos_dim,
+            gain=env.plant_gain,
+            control_limit=env.control_limit,
             process_noise=env.config.estimate_process_noise,
             meas_noise=max(float(env.config.sensor_noise_pos), 1e-4),
             delay=env.sensor_delay,
@@ -216,7 +225,7 @@ def run_closed_loop(
     measurements: List[np.ndarray] = []
     estimates: List[np.ndarray] = []
     wants_spikes = bool(record_spikes and getattr(controller, "spiking", False))
-    u_prev = torch.zeros(2, dtype=state.dtype, device=device)
+    u_prev = torch.zeros(spec.control_dim, dtype=state.dtype, device=device)
 
     with torch.no_grad():
         for k in range(steps):
@@ -242,12 +251,15 @@ def run_closed_loop(
                 if env.last_impulse:
                     impulse_frames.append(k)
             else:
-                state = step_physics(state, u, dt=reference.dt)
+                state = spec.step_fn(
+                    state, u, dt=reference.dt, limit=spec.control_limit,
+                    gain=spec.plant_gain, damping=0.0, disturbance=None,
+                )
             u_prev = u
 
     trajectory = np.asarray(traj)
     tilt_arr = np.asarray(tilts)
-    err = mean_radial_error_cm(trajectory, reference)
+    err = spec.tracking_error_cm(trajectory, reference)
 
     # Settling: first index after which the error never again exceeds 2x its
     # steady-state (last-decile) median.
@@ -262,8 +274,8 @@ def run_closed_loop(
     on_plate_pct = impulse_count = recovery = max_recovery = drms = env_meta = None
     est_pos_rmse = est_vel_rmse = None
     if use_env:
-        pos = trajectory[:, :2]
-        inside = np.all(np.abs(pos) <= PLATE_HALF, axis=1)
+        d = spec.pos_dim
+        inside = spec.in_bounds(trajectory)
         on_plate_pct = float(100.0 * np.mean(inside)) if len(inside) else 0.0
 
         recovery = []
@@ -286,8 +298,8 @@ def run_closed_loop(
         if estimates:
             ea = np.asarray(estimates)
             T = min(len(err), len(ea))
-            pos_err = np.linalg.norm(ea[:T, :2] - trajectory[:T, :2], axis=1) * 100.0
-            vel_err = np.linalg.norm(ea[:T, 2:] - trajectory[:T, 2:], axis=1)
+            pos_err = np.linalg.norm(ea[:T, :d] - trajectory[:T, :d], axis=1) * 100.0
+            vel_err = np.linalg.norm(ea[:T, d:2 * d] - trajectory[:T, d:2 * d], axis=1)
             est_pos_rmse = float(np.sqrt(np.mean(pos_err ** 2)))
             est_vel_rmse = float(np.sqrt(np.mean(vel_err ** 2)))
 
@@ -325,15 +337,13 @@ def evaluate(
 ) -> BenchmarkReport:
     """Evaluate several named controllers on a **shared** reference trajectory."""
     config = config or BenchmarkConfig()
+    spec = get_example(config.example)
     if reference is None:
-        reference = orbit_reference(
-            steps=config.steps,
-            radius=config.radius,
-            freq=config.freq,
-            device="cpu",
+        reference = spec.reference(
+            steps=config.steps, radius=config.radius, freq=config.freq, device="cpu",
         )
     if init_state is None:
-        init_state = torch.tensor([-0.05, 0.05, 0.0, 0.0])
+        init_state = torch.tensor(spec.init_state)
 
     embodiment = getattr(config, "embodiment", None)
     # The estimator is always on: even a "clean" run estimates velocity from
@@ -347,7 +357,7 @@ def evaluate(
         env = None
         if use_env:
             # A fresh env per controller, same seed -> identical disturbances.
-            env = EmbodiedEnv(embodiment, dt=reference.dt, init_state=init_tuple)
+            env = spec.make_env(embodiment, dt=reference.dt)
         results[name] = run_closed_loop(
             ctrl, reference=reference, init_state=init_state, config=config,
             name=name, env=env,

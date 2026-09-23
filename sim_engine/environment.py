@@ -22,9 +22,25 @@ import numpy as np
 import torch
 
 from .config import EMBODIMENT_PRESETS, EmbodimentConfig
-from .physics import C_CONST, DT, MAX_TILT, step_physics
+from .physics import C_CONST, DT, MAX_TILT, step_physics, step_point_mass
 
 __all__ = ["EmbodiedEnv", "embodiment_specs"]
+
+
+def _ball_step(state, command, *, dt, limit, gain, damping, disturbance):
+    """Plate plant wrapper: signed ``gain`` → positive rolling constant."""
+    return step_physics(
+        state, command, dt=dt, max_tilt=limit, c_const=abs(gain),
+        damping=damping, disturbance=disturbance,
+    )
+
+
+def _drone_step(state, command, *, dt, limit, gain, damping, disturbance):
+    """Point-mass plant wrapper (the control gain is 1 by construction)."""
+    return step_point_mass(
+        state, command, dt=dt, max_accel=limit,
+        damping=damping, disturbance=disturbance,
+    )
 
 
 def embodiment_specs() -> dict:
@@ -46,11 +62,18 @@ class EmbodiedEnv:
         max_tilt: float = MAX_TILT,
         device="cpu",
         dtype=torch.float32,
-        init_state: Tuple[float, float, float, float] = (-0.05, 0.05, 0.0, 0.0),
+        init_state: Tuple[float, ...] = (-0.05, 0.05, 0.0, 0.0),
+        pos_dim: int = 2,
+        plant_gain: float = -C_CONST,
+        step_fn=None,
     ) -> None:
         self.config = config or EmbodimentConfig()
         self.dt = dt
-        self.max_tilt = max_tilt
+        self.pos_dim = int(pos_dim)
+        self.control_limit = float(max_tilt)
+        self.max_tilt = self.control_limit        # legacy alias
+        self.plant_gain = float(plant_gain)       # signed control -> accel gain
+        self.step_fn = step_fn or _ball_step
         self.device = torch.device(device)
         self.dtype = dtype
         self.init_state = torch.as_tensor(init_state, dtype=dtype, device=self.device)
@@ -67,8 +90,8 @@ class EmbodiedEnv:
         self.impulse_std = self.config.impulse_std
         self.impulse_count = 0
         self._k = 0
-        self.last_disturbance = torch.zeros(2, dtype=dtype, device=self.device)
-        self.last_kick = torch.zeros(2, dtype=dtype, device=self.device)
+        self.last_disturbance = torch.zeros(self.pos_dim, dtype=dtype, device=self.device)
+        self.last_kick = torch.zeros(self.pos_dim, dtype=dtype, device=self.device)
         self.last_impulse = False
         self.reset()
 
@@ -97,12 +120,12 @@ class EmbodiedEnv:
         # Prefill both buffers with the initial position / zero command so the
         # first frames are not an artificial delayed transient (the camera is
         # position-only, so the sensor buffer holds 2-D vectors).
-        init_pos = self.init_state[:2].clone()
+        init_pos = self.init_state[:self.pos_dim].clone()
         self._sensor_buf = deque(
             [init_pos.clone() for _ in range(self.sensor_delay + 1)],
             maxlen=self.sensor_delay + 1,
         )
-        zero = torch.zeros(2, dtype=self.dtype, device=self.device)
+        zero = torch.zeros(self.pos_dim, dtype=self.dtype, device=self.device)
         self._actuator_buf = deque(
             [zero.clone() for _ in range(self.actuator_delay + 1)],
             maxlen=self.actuator_delay + 1,
@@ -120,9 +143,9 @@ class EmbodiedEnv:
         Velocity is **not** measured; reconstructing it is the estimator's job.
         """
         cfg = self.config
-        pos = state.detach().to(self.dtype)[:2].clone()
+        pos = state.detach().to(self.dtype)[:self.pos_dim].clone()
         if cfg.sensor_noise_pos:
-            noise = self._rng.normal(0.0, cfg.sensor_noise_pos, size=2)
+            noise = self._rng.normal(0.0, cfg.sensor_noise_pos, size=self.pos_dim)
             pos = pos + torch.as_tensor(noise, dtype=self.dtype, device=self.device)
         self._sensor_buf.append(pos)
         return self._sensor_buf[0]
@@ -136,7 +159,7 @@ class EmbodiedEnv:
             cmd = cmd * float(cfg.actuator_gain)
         if cfg.actuator_bias:
             cmd = cmd + float(cfg.actuator_bias)
-        cmd = torch.clamp(cmd, -self.max_tilt, self.max_tilt)
+        cmd = torch.clamp(cmd, -self.control_limit, self.control_limit)
         self._actuator_buf.append(cmd)
         return self._actuator_buf[0]
 
@@ -149,12 +172,12 @@ class EmbodiedEnv:
         directly to the ball's velocity.
         """
         cfg = self.config
-        accel = torch.zeros(2, dtype=self.dtype, device=self.device)
-        kick = torch.zeros(2, dtype=self.dtype, device=self.device)
+        accel = torch.zeros(self.pos_dim, dtype=self.dtype, device=self.device)
+        kick = torch.zeros(self.pos_dim, dtype=self.dtype, device=self.device)
         impulse = False
         if self.process_noise:
             accel = accel + torch.as_tensor(
-                self._rng.normal(0.0, self.process_noise, size=2),
+                self._rng.normal(0.0, self.process_noise, size=self.pos_dim),
                 dtype=self.dtype, device=self.device,
             )
         if self.impulse_std:
@@ -164,7 +187,7 @@ class EmbodiedEnv:
                 impulse = True
             if impulse:
                 kick = kick + torch.as_tensor(
-                    self._rng.normal(0.0, self.impulse_std, size=2),
+                    self._rng.normal(0.0, self.impulse_std, size=self.pos_dim),
                     dtype=self.dtype, device=self.device,
                 )
         return accel, kick, impulse
@@ -183,14 +206,14 @@ class EmbodiedEnv:
             self.impulse_count += 1
         if float(kick.abs().sum()) > 0.0:
             state = state.clone()
-            state[2] = state[2] + kick[0]
-            state[3] = state[3] + kick[1]
-        nxt = step_physics(
+            d = self.pos_dim
+            state[d:2 * d] = state[d:2 * d] + kick
+        nxt = self.step_fn(
             state,
             command,
             dt=self.dt,
-            max_tilt=self.max_tilt,
-            c_const=C_CONST * self.c_scale,
+            limit=self.control_limit,
+            gain=self.plant_gain * self.c_scale,
             damping=self.damping,
             disturbance=accel,
         )
@@ -204,6 +227,7 @@ class EmbodiedEnv:
             "preset": cfg.preset,
             "enable": bool(cfg.enable),
             "clean": cfg.is_clean,
+            "pos_dim": self.pos_dim,
             "sensor_noise_pos": cfg.sensor_noise_pos,
             "sensor_delay": self.sensor_delay,
             "actuator_delay": self.actuator_delay,

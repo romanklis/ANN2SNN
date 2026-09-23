@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import torch
 
-from ..physics import MAX_TILT, N_IN, N_OUT, clamp_action
+from ..physics import C_CONST, MAX_TILT, N_IN, N_OUT
 from .base import BaseController, error_vector
 
 __all__ = ["LosslessConnectomeSNN"]
@@ -63,9 +63,17 @@ class LosslessConnectomeSNN(BaseController):
         max_tilt: float = MAX_TILT,
         device=None,
         dtype=torch.float32,
+        plant_gain: float = -C_CONST,
+        pos_dim: int | None = None,
     ) -> None:
         device = device if device is not None else getattr(ann_model, "device", "cpu")
-        super().__init__(n_in=N_IN, n_out=N_OUT, device=device)
+        # inherit the transferred network's dimensions (6/2 ball, 9/3 drone)
+        n_in = int(getattr(ann_model, "n_in", N_IN))
+        n_out = int(getattr(ann_model, "n_out", N_OUT))
+        super().__init__(
+            n_in=n_in, n_out=n_out, device=device,
+            action_limit=max_tilt, plant_gain=plant_gain, pos_dim=pos_dim,
+        )
         self.micro_steps = int(micro_steps)
         self.v_th = float(v_th)
         self.max_tilt = max_tilt
@@ -118,7 +126,8 @@ class LosslessConnectomeSNN(BaseController):
 
             motor_spike_accum += torch.matmul(self.w_out, self._s)
 
-        tilt = clamp_action(motor_spike_accum / self.micro_steps, self.max_tilt)
+        tilt = torch.clamp(motor_spike_accum / self.micro_steps,
+                           -self.action_limit, self.action_limit)
         self._micro_spike_history.append(self._s.clone())
         return tilt, self._s.clone()
 

@@ -35,6 +35,7 @@ from .config import (
 from .controllers import BaseController
 from .environment import EmbodiedEnv
 from .estimators import KalmanFilter
+from .examples import get_example
 from .physics import BallPlatePlant, step_physics
 from .reference import Reference, orbit_reference
 from .registry import ControllerRegistry, LABELS
@@ -63,6 +64,7 @@ class Engine:
         self.config.training.device = self.device
 
         self.reference_cache: Dict[tuple, Reference] = {}
+        self.spec = get_example(self.config.benchmark.example)
 
         dense = connectome = None
         trained = False
@@ -112,6 +114,9 @@ class Engine:
             connectome=connectome,
             micro_steps=self.config.network.micro_steps,
             trained=trained,
+            action_limit=self.spec.control_limit,
+            plant_gain=self.spec.plant_gain,
+            pos_dim=self.spec.pos_dim,
         )
 
         self._sessions: Dict[str, "SimulationSession"] = {}
@@ -129,12 +134,13 @@ class Engine:
         freq: Optional[float] = None,
     ) -> Reference:
         bc = self.config.benchmark
+        spec = get_example(bc.example)
         steps = steps or bc.steps
         radius = bc.radius if radius is None else radius
         freq = bc.freq if freq is None else freq
-        key = (steps, radius, freq)
+        key = (spec.name, steps, radius, freq)
         if key not in self.reference_cache:
-            self.reference_cache[key] = orbit_reference(
+            self.reference_cache[key] = spec.reference(
                 steps=steps, radius=radius, freq=freq,
                 dt=self.config.plant.dt, device="cpu",
             )
@@ -154,20 +160,15 @@ class Engine:
         reference: Optional[Reference] = None,
         config: Optional[BenchmarkConfig] = None,
     ) -> TrajectoryResult:
-        """Run one controller over the full closed-loop orbit."""
+        """Run one controller over the full closed-loop trajectory."""
         ctrl = self.build_controller(name)
-        init = torch.tensor(self.config.plant.init_state, dtype=torch.float32)
         cfg = config or self.config.benchmark
+        spec = get_example(cfg.example)
+        init = torch.tensor(spec.init_state, dtype=torch.float32)
         emb = getattr(cfg, "embodiment", None)
         env = None
         if emb is not None and emb.enable:
-            env = EmbodiedEnv(
-                emb,
-                dt=self.config.plant.dt,
-                max_tilt=self.config.plant.max_tilt,
-                device=self.device,
-                init_state=self.config.plant.init_state,
-            )
+            env = spec.make_env(emb, dt=self.config.plant.dt, device=self.device)
         return run_closed_loop(
             ctrl,
             reference=reference or self.reference(),
@@ -175,6 +176,7 @@ class Engine:
             config=cfg,
             name=name,
             env=env,
+            example=spec.name,
         )
 
     def run_benchmark(
@@ -187,10 +189,11 @@ class Engine:
         """Evaluate several controllers on a shared reference trajectory."""
         names = list(names) if names else list(self.config.default_controllers)
         controllers = {n: self.build_controller(n) for n in names}
+        spec = get_example(self.config.benchmark.example)
         report = evaluate(
             controllers,
             reference=self.reference(),
-            init_state=torch.tensor(self.config.plant.init_state, dtype=torch.float32),
+            init_state=torch.tensor(spec.init_state, dtype=torch.float32),
             config=self.config.benchmark,
         )
         return report.to_dict(include_trace=include_trace) if as_dict else report
@@ -270,39 +273,24 @@ class SimulationSession:
         self.id = uuid.uuid4().hex
         self.engine = engine
         self.name = engine.registry.resolve(name)
+        self.spec = get_example(engine.config.benchmark.example)
         self.reference = engine.reference(steps=steps, radius=radius, freq=freq)
         self.auto_reset = auto_reset
         self.init_state = tuple(
-            init_state if init_state is not None else engine.config.plant.init_state
+            init_state if init_state is not None else self.spec.init_state
         )
-        self.plant = BallPlatePlant(
-            init_state=self.init_state,
-            dt=engine.config.plant.dt,
-            max_tilt=engine.config.plant.max_tilt,
-            device=engine.device,
-        )
+        self.plant = self.spec.make_plant(dt=engine.config.plant.dt, device=engine.device)
         self.controller = engine.build_controller(self.name)
         emb = engine.config.benchmark.embodiment
         self.env = None
         self.estimator = None
         if emb is not None and emb.enable:
-            self.env = EmbodiedEnv(
-                emb,
-                dt=engine.config.plant.dt,
-                max_tilt=engine.config.plant.max_tilt,
-                device=engine.device,
-                init_state=self.init_state,
+            self.env = self.spec.make_env(emb, dt=engine.config.plant.dt, device=engine.device)
+            self.estimator = self.spec.make_estimator(
+                emb, dt=engine.config.plant.dt, device=engine.device
             )
-            self.estimator = KalmanFilter(
-                dt=engine.config.plant.dt,
-                process_noise=emb.estimate_process_noise,
-                meas_noise=max(float(emb.sensor_noise_pos), 1e-4),
-                delay=self.env.sensor_delay,
-                init_pos_var=emb.estimate_init_pos_var,
-                init_vel_var=emb.estimate_init_vel_var,
-                device=engine.device,
-            )
-        self._u_prev = torch.zeros(2, dtype=torch.float32, device=engine.device)
+        self._u_prev = torch.zeros(self.spec.control_dim, dtype=torch.float32,
+                                   device=engine.device)
         self.k = 0
         self.done = False
         self.history: Dict[str, list] = {"state": [], "tilt": [], "error_cm": [], "target": []}
@@ -316,7 +304,8 @@ class SimulationSession:
             self.env.reset()
         if self.estimator is not None:
             self.estimator.reset()
-        self._u_prev = torch.zeros(2, dtype=torch.float32, device=self.engine.device)
+        self._u_prev = torch.zeros(self.spec.control_dim, dtype=torch.float32,
+                                   device=self.engine.device)
         self.k = 0
         self.done = False
         self.history = {"state": [], "tilt": [], "error_cm": [], "target": []}
@@ -366,22 +355,26 @@ class SimulationSession:
         return obs
 
     # -- observation -------------------------------------------------------- #
+    def _error_cm(self, state: np.ndarray, idx: int) -> float:
+        d = self.spec.pos_dim
+        ref = self.reference.at(idx)
+        target = ref.pos.detach().cpu().numpy()
+        return float(np.linalg.norm(state[:d] - target) * 100.0)
+
     def _record_current(self) -> None:
         st = self.plant.state.detach().cpu().numpy()
         ref = self.reference.at(self.k)
         target = ref.pos.detach().cpu().numpy()
         self.history["state"].append(st)
         self.history["target"].append(target)
-        self.history["error_cm"].append(
-            float(np.linalg.norm(st[:2] - target) * 100.0)
-        )
+        self.history["error_cm"].append(self._error_cm(st, self.k))
 
     def observe(self, tilt=None) -> dict:
         st = self.plant.state.detach().cpu().numpy()
         idx = min(self.k, len(self.reference) - 1)
         ref = self.reference.at(idx)
         target = ref.pos.detach().cpu().numpy()
-        err_cm = float(np.linalg.norm(st[:2] - target) * 100.0)
+        err_cm = self._error_cm(st, idx)
         spikes = self.controller.last_spikes()
         return {
             "session_id": self.id,

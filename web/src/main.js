@@ -28,7 +28,12 @@ const el = {
   apiPill: $("api-pill"),
   trainedPill: $("trained-pill"),
   capturePill: $("capture-pill"),
+  exampleSelect: $("example-select"),
   envSelect: $("env-select"),
+  pipePlant: $("pipe-plant"),
+  pipeKalman: $("pipe-kalman"),
+  controlTitle: $("control-title"),
+  trackingTitle: $("tracking-title"),
   profilePill: $("profile-pill"),
   robustStrip: $("robust-strip"),
   clock: $("clock"),
@@ -68,7 +73,22 @@ const state = {
   envPreset: "embodied",
   profile: "robust",
   envSpecs: {},
+  example: "ball",
+  examples: {},
 };
+
+function exampleSpec() {
+  return state.examples[state.example] || {};
+}
+function exampleDefaults() {
+  const d = exampleSpec().defaults || {};
+  return { radius: d.radius ?? BENCH.radius, freq: d.freq ?? BENCH.freq };
+}
+function exampleExtent() {
+  const hi = exampleSpec().bounds_high || [];
+  const e = hi.length ? Math.max(...hi.map((v) => Math.abs(v))) : 0.25;
+  return e || 0.25;
+}
 
 // ------------------------------------------------------------------ helpers
 function showBanner(html) {
@@ -112,6 +132,51 @@ function updateClock(k) {
   el.clock.textContent = `t = ${(k * dt).toFixed(2)} s`;
 }
 
+// -------------------------------------------------------------------- example
+// The example (plant + task + estimator model + metric + labels/units) is a
+// selectable dimension: the same controller pair runs on each one, and every
+// panel label/unit, the stage renderer and the success label come from the
+// selected example's catalogue entry (GET /api/controllers -> examples).
+function populateExampleSelect(cat) {
+  if (!el.exampleSelect || el.exampleSelect.dataset.ready === "1") return;
+  const specs = cat.examples || [];
+  if (!specs.length) return;
+  state.examples = Object.fromEntries(specs.map((s) => [s.name, s]));
+  const names = specs.map((s) => s.name);
+  state.example = names.includes(cat.default_example) ? cat.default_example : names[0];
+  el.exampleSelect.innerHTML = specs
+    .map((s) => `<option value="${escapeHtml(s.name)}">${escapeHtml(s.label)}</option>`)
+    .join("");
+  el.exampleSelect.value = state.example;
+  el.exampleSelect.disabled = false;
+  el.exampleSelect.dataset.ready = "1";
+}
+function applyExampleLabels() {
+  const spec = exampleSpec();
+  const labels = spec.labels || {};
+  const units = spec.units || {};
+  const D = spec.pos_dim || 2;
+  const pos = ["x", "y", "z"].slice(0, D);
+  const vel = pos.map((p) => `v${p}`);
+
+  if (el.pipePlant) {
+    el.pipePlant.textContent = labels.plant || (spec.label || "PLANT").toUpperCase();
+  }
+  if (el.pipeKalman) {
+    el.pipeKalman.firstChild.textContent = `x̂ = [${pos.concat(vel).join(", ")}] `;
+  }
+  if (el.controlTitle) {
+    el.controlTitle.innerHTML =
+      `Control output · ${String(labels.command || "command").toLowerCase()} ` +
+      `<span class="unit">[${units.command || ""}]</span>`;
+  }
+  if (el.trackingTitle) {
+    el.trackingTitle.innerHTML =
+      `Tracking · ${String(labels.error || "error").toLowerCase()} ` +
+      `<span class="unit">[${units.error || ""}]</span>`;
+  }
+}
+
 // ------------------------------------------------------------- environment
 function populateEnvSelect(cat) {
   if (!el.envSelect || el.envSelect.dataset.ready === "1") return;
@@ -137,6 +202,7 @@ async function loadRobustness() {
   try {
     const res = await api.robustness({
       controllers: [ANN, SNN], axis: "preset", steps: 120, seed: BENCH.seed,
+      example: state.example,
     });
     el.robustStrip.innerHTML =
       '<span class="rb-head">ROBUSTNESS · mean cm (ANN / SNN)</span>' +
@@ -162,19 +228,25 @@ async function loadOnce() {
     const cat = await api.fetchControllers();
     state.catalog = Object.fromEntries((cat.catalog || []).map((c) => [c.name, c]));
     state.envSpecs = cat.embodiment_presets || {};
+    populateExampleSelect(cat);
     populateEnvSelect(cat);
+    applyExampleLabels();
     applyProfile();
+
+    const { radius, freq } = exampleDefaults();
+    const spec = exampleSpec();
 
     const body = await api.benchmark({
       controllers: [ANN, SNN],
       steps: BENCH.steps,
       seed: BENCH.seed,
-      radius: BENCH.radius,
-      freq: BENCH.freq,
+      radius,
+      freq,
       include_trace: true,
       spike_format: "events",
       embodiment: state.envPreset,
       profile: state.profile,
+      example: state.example,
     });
     state.results = body.results || {};
     state.stats = body.stats || null;
@@ -186,7 +258,7 @@ async function loadOnce() {
     const T = Math.max(ann.trajectory?.length || 0, snn.trajectory?.length || 0);
     const tMax = T * dt;
 
-    // hero: the experiment pair only (ANN first, so the SNN ball draws on top)
+    // hero: the experiment pair only (ANN first, so the SNN body draws on top)
     stage.setScene({
       reference: body.reference,
       series: [
@@ -194,8 +266,11 @@ async function loadOnce() {
         { name: SNN, color: SNN_COLOR, trajectory: snn.trajectory || [],
           estimates: snn.estimates, ring: true },
       ],
-      plateHalf: body.stats?.plate_half_m ?? cat.plate_half ?? 0.25,
+      plateHalf: exampleExtent(),
       measurements: snn.measurements || ann.measurements || null,
+      renderer: spec.renderer || "plate",
+      successLabel: spec.labels?.success || "ON PLATE",
+      boundsHigh: spec.bounds_high || null,
     });
     stage.setLoop(true);
 
@@ -210,12 +285,17 @@ async function loadOnce() {
     el.neuronCount.textContent = `${cat.n_neurons ?? totalN} neurons`;
     el.frameCount.textContent = `${BENCH.steps} frames`;
 
-    // control output (SNN plate tilt) + tracking (ANN vs SNN error)
+    // control output (SNN command, one lane per controlled axis) + tracking
+    const cmdPrefix = spec.units?.command === "rad" ? "θ" : "a";
+    const axisNames = ["x", "y", "z"].slice(0, spec.pos_dim || 2);
+    const axisColors = ["#4da3ff", "#dd8452", "#7ee0c0"];
     controlChart.setData({
-      series: [
-        { label: "θx", color: "#4da3ff", values: (snn.tilts || []).map((t) => t[0]), dash: false },
-        { label: "θy", color: "#dd8452", values: (snn.tilts || []).map((t) => t[1]), dash: true },
-      ],
+      series: axisNames.map((a, i) => ({
+        label: `${cmdPrefix}${a}`,
+        color: axisColors[i % axisColors.length],
+        values: (snn.tilts || []).map((t) => t[i] ?? 0),
+        dash: i % 2 === 1,
+      })),
       zeroLine: true,
       tMax,
     });
@@ -235,7 +315,13 @@ async function loadOnce() {
     setPill(el.trainedPill, cat.trained ? "trained" : "untrained", cat.trained ? "pill-ok" : "pill-idle");
     setPill(el.apiPill, "API ok", "pill-ok");
     el.playBtn.disabled = false;
-    [el.recordBtn, el.recordTabBtn, el.exportBtn].forEach((b) => (b.disabled = false));
+    el.recordBtn.disabled = false;
+    el.recordTabBtn.disabled = false;
+    // the server-side MP4 renderer is still plate-only (ball)
+    el.exportBtn.disabled = state.example !== "ball";
+    el.exportBtn.title = state.example === "ball"
+      ? "Export MP4 of the SNN (server)"
+      : `MP4 export supports the 'ball' example only (got '${state.example}')`;
     if (!canvasRecordingSupported()) setPill(el.capturePill, "no capture", "pill-bad");
 
     updateClock(0);
@@ -265,8 +351,9 @@ function buildResultBar(ann, snn) {
   el.resultDelta.textContent = signed(delta);
   el.resultDelta.parentElement.title = "difference (SNN − ANN)";
   const est = stats[SNN]?.estimation_pos_rmse_cm;
+  const errLabel = String(exampleSpec().labels?.error || "tracking error").toLowerCase();
   el.resultNote.textContent =
-    `closed-loop radial tracking error · Δ = SNN − ANN · env ${state.envPreset} · policy ${state.profile}` +
+    `closed-loop ${errLabel} · Δ = SNN − ANN · ${state.example} · env ${state.envPreset} · policy ${state.profile}` +
     (est != null ? ` · x̂ RMSE ${fmt(est)} cm` : "");
 }
 
@@ -310,12 +397,14 @@ async function exportMp4() {
   el.exportBtn.disabled = true;
   setPill(el.capturePill, "rendering MP4…", "pill-bad");
   try {
+    const { radius, freq } = exampleDefaults();
     const blob = await api.exportMp4({
       controller: SNN,
       seed: BENCH.seed,
       steps: BENCH.steps,
-      radius: BENCH.radius,
-      freq: BENCH.freq,
+      radius,
+      freq,
+      example: state.example,
     });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -344,6 +433,11 @@ el.exportBtn.addEventListener("click", exportMp4);
 el.envSelect.addEventListener("change", () => {
   state.envPreset = el.envSelect.value;
   applyProfile();
+  loadOnce();
+});
+el.exampleSelect.addEventListener("change", () => {
+  state.example = el.exampleSelect.value;
+  applyExampleLabels();
   loadOnce();
 });
 
